@@ -166,16 +166,15 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       try {
         setIsLoading(true);
 
-        // Load config without auto-joining Tailscale; we may prompt first.
-        await initializeServerConfig({ rehydrateTailscale: false });
+        // Load config WITHOUT network probes (stored LAN URL is unreachable on
+        // cellular) and WITHOUT auto-joining Tailscale — we prompt first.
+        await initializeServerConfig({
+          rehydrateTailscale: false,
+          detect: false,
+        });
 
         const serverConfig = await AsyncStorage.getItem("serverConfig");
         const legacyServer = await AsyncStorage.getItem("server");
-
-        await getVersionInfo();
-
-        const shouldShowUpdateScreen = await checkShouldShowUpdateScreen();
-        setShowUpdateScreen(shouldShowUpdateScreen);
 
         const serverConfigured = !!(serverConfig || legacyServer);
         setHasServerConfigured(serverConfigured);
@@ -196,6 +195,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
           // If a Tailscale auth key is saved and no live forward exists, ask
           // whether this session should use Tailscale or direct/LAN.
+          // This MUST happen before any network calls (getVersionInfo etc.) so
+          // cellular users are not blocked by a 30s timeout to an unreachable LAN IP.
           const tsConfigured = await isTailscaleConfigured();
           const live =
             displayUrl && tsConfigured
@@ -204,8 +205,22 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
           if (tsConfigured && displayUrl && !live) {
             setIsLoading(false);
             await promptNetworkMode(displayUrl);
-            // Choice handler already applied transport mode.
+            // Choice handler already applied transport mode + re-detected.
             setIsLoading(true);
+          }
+
+          // Best-effort version + update check. Runs after the chooser and never
+          // blocks boot: on cellular the LAN /version request would throw, and the
+          // GitHub check needs a hard timeout to avoid a multi-minute hang.
+          try {
+            const [versionRes, shouldShowUpdate] = await Promise.all([
+              getVersionInfo().catch(() => null),
+              checkShouldShowUpdateScreen(),
+            ]);
+            void versionRes;
+            if (shouldShowUpdate) setShowUpdateScreen(true);
+          } catch {
+            // never block boot on update checks
           }
 
           let authStatus = false;

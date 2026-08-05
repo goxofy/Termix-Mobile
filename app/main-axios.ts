@@ -286,6 +286,12 @@ export type InitializeServerConfigOptions = {
    * reused and not torn down.
    */
   rehydrateTailscale?: boolean;
+  /**
+   * When false, skip the root-vs-/ssh network probes. Use during boot before a
+   * transport is chosen (the stored LAN URL is not reachable from cellular),
+   * then let applyServerTransportMode / later calls run detection.
+   */
+  detect?: boolean;
 };
 
 /**
@@ -406,7 +412,9 @@ export async function initializeServerConfig(
         }
 
         updateApiInstances();
-        await detectAndUpdateApiInstances();
+        if (options.detect !== false) {
+          await detectAndUpdateApiInstances();
+        }
       }
     }
   } catch (error) {
@@ -3120,6 +3128,7 @@ export async function getLatestGitHubRelease(): Promise<{
   try {
     const response = await axios.get(
       "https://api.github.com/repos/Termix-SSH/Mobile/releases/latest",
+      { timeout: 8000 },
     );
     const release = response.data;
 
