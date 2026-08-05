@@ -69,7 +69,6 @@ export async function setCookie(
     systemLogger.error(`[setCookie] Failed to persist ${name} to AsyncStorage`, error, {
       operation: "set_cookie",
     });
-    throw error;
   }
 }
 
@@ -264,11 +263,14 @@ export function setAuthStateCallback(
 }
 
 let configuredServerUrl: string | null = null;
+/** Full last-saved config (includes displayUrl / viaTailscale when set). */
+let configuredServerMeta: ServerConfig | null = null;
 
 export async function saveServerConfig(config: ServerConfig): Promise<boolean> {
   try {
     await AsyncStorage.setItem("serverConfig", JSON.stringify(config));
     configuredServerUrl = config.serverUrl;
+    configuredServerMeta = config;
     updateApiInstances();
     await detectAndUpdateApiInstances();
     return true;
@@ -277,55 +279,143 @@ export async function saveServerConfig(config: ServerConfig): Promise<boolean> {
   }
 }
 
-export async function initializeServerConfig(): Promise<void> {
-  try {
-    const [configStr, legacyServerStr] = await Promise.all([
-      AsyncStorage.getItem("serverConfig"),
-      AsyncStorage.getItem("server"),
-    ]);
+export type InitializeServerConfigOptions = {
+  /**
+   * When true (default), try to keep/restore a Tailscale localhost forward if
+   * the saved config used Tailscale. Safe to call repeatedly: live forwards are
+   * reused and not torn down.
+   */
+  rehydrateTailscale?: boolean;
+  /**
+   * When false, skip the root-vs-/ssh network probes. Use during boot before a
+   * transport is chosen (the stored LAN URL is not reachable from cellular),
+   * then let applyServerTransportMode / later calls run detection.
+   */
+  detect?: boolean;
+};
 
-    let serverUrl: string | null = null;
+/**
+ * Load server config into memory and refresh axios bases.
+ *
+ * IMPORTANT: Hosts and other screens call this often. It must NOT destroy an
+ * already-working Tailscale localhost forward (that was the "loading hosts"
+ * hang after login).
+ */
+export async function initializeServerConfig(
+  options: InitializeServerConfigOptions = {},
+): Promise<void> {
+  const rehydrateTailscale = options.rehydrateTailscale !== false;
+
+  try {
+    const configStr = await AsyncStorage.getItem("serverConfig");
 
     if (configStr) {
-      try {
-        const config = JSON.parse(configStr);
-        if (typeof config?.serverUrl === "string" && config.serverUrl.trim()) {
-          serverUrl = config.serverUrl.trim();
-        }
-      } catch (error) {
-        systemLogger.warn("[initializeServerConfig] Invalid serverConfig JSON", {
-          operation: "initialize_server_config",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
+      const config = JSON.parse(configStr) as ServerConfig;
 
-    if (!serverUrl && legacyServerStr) {
-      try {
-        const legacyServer = JSON.parse(legacyServerStr);
-        const legacyUrl = legacyServer?.serverUrl ?? legacyServer?.ip;
-        if (typeof legacyUrl === "string" && legacyUrl.trim()) {
-          serverUrl = legacyUrl.trim();
-          await AsyncStorage.setItem(
-            "serverConfig",
-            JSON.stringify({
-              serverUrl,
-              lastUpdated: new Date().toISOString(),
-            }),
-          );
-        }
-      } catch (error) {
-        systemLogger.warn("[initializeServerConfig] Invalid legacy server data", {
-          operation: "initialize_server_config",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
+      if (config?.serverUrl || config?.displayUrl) {
+        const displayUrl = config.displayUrl || config.serverUrl;
+        configuredServerMeta = { ...config, displayUrl };
+        configuredServerUrl = config.serverUrl || displayUrl;
 
-    if (serverUrl) {
-      configuredServerUrl = serverUrl;
-      updateApiInstances();
-      await detectAndUpdateApiInstances();
+        // Prefer a live Tailscale forward over stale localhost ports from disk.
+        if (displayUrl) {
+          try {
+            const {
+              getLiveTransportUrl,
+              rehydrateTailscaleTransport,
+              isTailscaleConfigured,
+            } = await import("./utils/tailscaleConnect");
+
+            const live = getLiveTransportUrl(displayUrl);
+            if (live) {
+              configuredServerUrl = live;
+              configuredServerMeta = {
+                ...configuredServerMeta,
+                serverUrl: live,
+                displayUrl,
+                viaTailscale: true,
+              };
+            } else if (
+              rehydrateTailscale &&
+              (config.viaTailscale || (await isTailscaleConfigured()))
+            ) {
+              // Only auto-rejoin when the last session used TS, or when the
+              // caller explicitly wants rehydrate (boot path handles chooser).
+              if (config.viaTailscale) {
+                const transportUrl =
+                  await rehydrateTailscaleTransport(displayUrl);
+                if (transportUrl) {
+                  configuredServerUrl = transportUrl;
+                  configuredServerMeta = {
+                    ...configuredServerMeta,
+                    serverUrl: transportUrl,
+                    displayUrl,
+                    viaTailscale: true,
+                    lastUpdated: new Date().toISOString(),
+                  };
+                  // Persist transport only for crash recovery hints; displayUrl stays.
+                  await AsyncStorage.setItem(
+                    "serverConfig",
+                    JSON.stringify({
+                      ...configuredServerMeta,
+                      // Store display as serverUrl fallback so cold start without
+                      // rehydrate still has a usable absolute URL.
+                      serverUrl: displayUrl,
+                      displayUrl,
+                      viaTailscale: true,
+                    }),
+                  );
+                } else {
+                  // Keep memory pointing at display URL for direct attempt; do not
+                  // wipe viaTailscale capability from disk permanently here.
+                  configuredServerUrl = displayUrl;
+                  configuredServerMeta = {
+                    ...configuredServerMeta,
+                    serverUrl: displayUrl,
+                    displayUrl,
+                    viaTailscale: false,
+                  };
+                }
+              }
+            } else if (
+              configuredServerUrl?.includes("127.0.0.1") &&
+              displayUrl &&
+              !live
+            ) {
+              // Stale localhost from a previous process — fall back to display.
+              configuredServerUrl = displayUrl;
+              configuredServerMeta = {
+                ...configuredServerMeta,
+                serverUrl: displayUrl,
+                displayUrl,
+                viaTailscale: false,
+              };
+            }
+          } catch (e) {
+            systemLogger.warn(
+              "[initializeServerConfig] Tailscale rehydrate failed",
+              {
+                operation: "initialize_server_config",
+                error: e instanceof Error ? e.message : String(e),
+              },
+            );
+            if (displayUrl) {
+              configuredServerUrl = displayUrl;
+              configuredServerMeta = {
+                ...configuredServerMeta!,
+                serverUrl: displayUrl,
+                displayUrl,
+                viaTailscale: false,
+              };
+            }
+          }
+        }
+
+        updateApiInstances();
+        if (options.detect !== false) {
+          await detectAndUpdateApiInstances();
+        }
+      }
     }
   } catch (error) {
     systemLogger.error("[initializeServerConfig] Failed to load server config", error, {
@@ -334,8 +424,112 @@ export async function initializeServerConfig(): Promise<void> {
   }
 }
 
+/**
+ * Apply transport for the session: direct display URL, or Tailscale forward.
+ * Persists displayUrl + viaTailscale preference without requiring re-entry.
+ */
+export async function applyServerTransportMode(
+  mode: "direct" | "tailscale",
+): Promise<boolean> {
+  const displayUrl =
+    configuredServerMeta?.displayUrl ||
+    configuredServerMeta?.serverUrl ||
+    configuredServerUrl;
+  if (!displayUrl || displayUrl.includes("127.0.0.1")) {
+    // Need a real remote origin; refuse to treat localhost as display URL.
+    if (!configuredServerMeta?.displayUrl) return false;
+  }
+  const origin =
+    configuredServerMeta?.displayUrl ||
+    (!displayUrl.includes("127.0.0.1") ? displayUrl : null);
+  if (!origin) return false;
+
+  try {
+    if (mode === "direct") {
+      const { disconnectTailscaleForwards } = await import(
+        "./utils/tailscaleConnect"
+      );
+      try {
+        await disconnectTailscaleForwards();
+      } catch {
+        // optional
+      }
+      configuredServerUrl = origin;
+      configuredServerMeta = {
+        serverUrl: origin,
+        displayUrl: origin,
+        viaTailscale: false,
+        lastUpdated: new Date().toISOString(),
+      };
+      await AsyncStorage.setItem(
+        "serverConfig",
+        JSON.stringify(configuredServerMeta),
+      );
+      updateApiInstances();
+      await detectAndUpdateApiInstances();
+      return true;
+    }
+
+    const { rehydrateTailscaleTransport, loadTailscaleSettings } = await import(
+      "./utils/tailscaleConnect"
+    );
+    const settings = await loadTailscaleSettings();
+    if (!settings.authKey) return false;
+
+    const transportUrl = await rehydrateTailscaleTransport(origin);
+    if (!transportUrl) return false;
+
+    // Disk keeps the real origin; memory uses localhost transport.
+    configuredServerMeta = {
+      serverUrl: origin,
+      displayUrl: origin,
+      viaTailscale: true,
+      lastUpdated: new Date().toISOString(),
+    };
+    await AsyncStorage.setItem(
+      "serverConfig",
+      JSON.stringify(configuredServerMeta),
+    );
+    configuredServerUrl = transportUrl;
+    updateApiInstances();
+    await detectAndUpdateApiInstances();
+    return true;
+  } catch (e) {
+    systemLogger.warn("[applyServerTransportMode] failed", {
+      operation: "apply_server_transport_mode",
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
+}
+
 export function getCurrentServerUrl(): string | null {
   return configuredServerUrl;
+}
+
+/** User-facing URL (Tailscale remote / LAN), falling back to transport URL. */
+export function getDisplayServerUrl(): string | null {
+  return (
+    configuredServerMeta?.displayUrl ||
+    configuredServerMeta?.serverUrl ||
+    configuredServerUrl
+  );
+}
+
+export function getServerConfigMeta(): ServerConfig | null {
+  return configuredServerMeta;
+}
+
+/**
+ * Point axios/WS at a transport URL without rewriting the persisted display URL.
+ * Used after Tailscale local-forward setup (http://127.0.0.1:port).
+ */
+export async function setRuntimeTransportUrl(
+  transportUrl: string,
+): Promise<void> {
+  configuredServerUrl = transportUrl.replace(/\/$/, "");
+  updateApiInstances();
+  await detectAndUpdateApiInstances();
 }
 
 /**
@@ -396,6 +590,13 @@ export async function clearServerConfig(): Promise<void> {
     await AsyncStorage.removeItem("serverConfig");
     await AsyncStorage.removeItem("server");
     configuredServerUrl = null;
+    configuredServerMeta = null;
+    try {
+      const { shutdownTailscale } = await import("./utils/tailscaleConnect");
+      await shutdownTailscale();
+    } catch {
+      // optional native module
+    }
     systemLogger.info("Server configuration cleared", {
       operation: "clear_server_config",
     });
@@ -2265,9 +2466,8 @@ function extractJwtFromSetCookie(headers: any): string | null {
   if (cookieHeader) {
     const cookies = Array.isArray(cookieHeader) ? cookieHeader : [cookieHeader];
     for (const cookie of cookies) {
-      const match = String(cookie).match(/(?:^|,\s*)jwt=([^;]+)/);
-      if (match) {
-        return match[1];
+      if (cookie.startsWith("jwt=")) {
+        return cookie.split("jwt=")[1].split(";")[0];
       }
     }
   }
@@ -2339,7 +2539,6 @@ async function loginWithFetch(
   const fetchResponse = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    credentials: "include",
     body: JSON.stringify({ username, password }),
   });
 
@@ -2387,36 +2586,6 @@ async function loginWithFetch(
   return { data, token };
 }
 
-async function fetchReusableJwtFromSession(
-  baseUrls: string[],
-): Promise<string | null> {
-  const uniqueBaseUrls = [
-    ...new Set(baseUrls.map((base) => base.replace(/\/$/, ""))),
-  ];
-
-  for (const baseUrl of uniqueBaseUrls) {
-    try {
-      const response = await fetch(`${baseUrl}/users/me/token`, {
-        method: "GET",
-        credentials: "include",
-        headers: { Accept: "application/json" },
-      });
-      if (!response.ok) {
-        continue;
-      }
-
-      const data = await response.json();
-      if (typeof data?.token === "string" && data.token) {
-        return data.token;
-      }
-    } catch {
-      // Try the next API layout before reporting a missing reusable token.
-    }
-  }
-
-  return null;
-}
-
 export async function loginUser(
   username: string,
   password: string,
@@ -2445,24 +2614,11 @@ export async function loginUser(
       }
     }
 
-    if (!finalToken) {
-      finalToken = await fetchReusableJwtFromSession([
-        baseUrl,
-        getSshBase(8081),
-      ]);
+    if (finalToken) {
+      await AsyncStorage.setItem("jwt", finalToken);
     }
 
-    if (!finalToken) {
-      throw new ApiError(
-        "The server signed in successfully but did not expose a reusable mobile token. Update Termix Server or enable /users/me/token.",
-        undefined,
-        "AUTH_TOKEN_MISSING",
-      );
-    }
-
-    await AsyncStorage.setItem("jwt", finalToken);
-
-    return { ...data, token: finalToken };
+    return { ...data, token: finalToken || "" };
   } catch (error: any) {
     if (error?.code === "PROXY_AUTH_GATE") {
       throw new ApiError(error.message, 0, "PROXY_AUTH_GATE");
@@ -2480,24 +2636,11 @@ export async function loginUser(
           return { ...data, token: data.temp_token || "" };
         }
 
-        const finalToken =
-          token ||
-          (await fetchReusableJwtFromSession([
-            altBase,
-            getRootBase(8081),
-          ]));
-
-        if (!finalToken) {
-          throw new ApiError(
-            "The server signed in successfully but did not expose a reusable mobile token. Update Termix Server or enable /users/me/token.",
-            undefined,
-            "AUTH_TOKEN_MISSING",
-          );
+        if (token) {
+          await AsyncStorage.setItem("jwt", token);
         }
 
-        await AsyncStorage.setItem("jwt", finalToken);
-
-        return { ...data, token: finalToken };
+        return { ...data, token: token || "" };
       } catch (e: any) {
         if (e?.code === "PROXY_AUTH_GATE") {
           throw new ApiError(e.message, 0, "PROXY_AUTH_GATE");
@@ -2528,13 +2671,9 @@ export async function getUserInfo(): Promise<UserInfo> {
   } catch (error: any) {
     if (error?.response?.status === 404) {
       try {
-        const token = await getCookie("jwt");
         const alt = axios.create({
           baseURL: getSshBase(8081),
-          headers: {
-            "Content-Type": "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
+          headers: { "Content-Type": "application/json" },
         });
         const response = await alt.get("/users/me");
         return response.data;
@@ -2880,28 +3019,25 @@ export async function verifyTOTPLogin(
       totp_code,
     });
 
-    const token = extractJwtFromSetCookie(response.headers);
-    let finalToken = token || response.data.token;
-    if (!finalToken) {
-      finalToken = await fetchReusableJwtFromSession([
-        getRootBase(8081),
-        getSshBase(8081),
-      ]);
-    }
-    if (!finalToken) {
-      throw new ApiError(
-        "The server signed in successfully but did not expose a reusable mobile token. Update Termix Server or enable /users/me/token.",
-        undefined,
-        "AUTH_TOKEN_MISSING",
-      );
+    let token = null;
+    const cookieHeader = response.headers["set-cookie"];
+    if (cookieHeader && Array.isArray(cookieHeader)) {
+      for (const cookie of cookieHeader) {
+        if (cookie.startsWith("jwt=")) {
+          token = cookie.split("jwt=")[1].split(";")[0];
+          break;
+        }
+      }
     }
 
     const result = {
       ...response.data,
-      token: finalToken,
+      token: token || response.data.token,
     };
 
-    await AsyncStorage.setItem("jwt", finalToken);
+    if (result.token) {
+      await AsyncStorage.setItem("jwt", result.token);
+    }
 
     return result;
   } catch (error: any) {
@@ -2922,28 +3058,25 @@ export async function verifyTOTPLogin(
           totp_code,
         });
 
-        const extractedToken = extractJwtFromSetCookie(response.headers);
-        let finalToken = extractedToken || response.data.token;
-        if (!finalToken) {
-          finalToken = await fetchReusableJwtFromSession([
-            getSshBase(8081),
-            getRootBase(8081),
-          ]);
-        }
-        if (!finalToken) {
-          throw new ApiError(
-            "The server signed in successfully but did not expose a reusable mobile token. Update Termix Server or enable /users/me/token.",
-            undefined,
-            "AUTH_TOKEN_MISSING",
-          );
+        let extractedToken = null;
+        const cookieHeader = response.headers["set-cookie"];
+        if (cookieHeader && Array.isArray(cookieHeader)) {
+          for (const cookie of cookieHeader) {
+            if (cookie.startsWith("jwt=")) {
+              extractedToken = cookie.split("jwt=")[1].split(";")[0];
+              break;
+            }
+          }
         }
 
         const result = {
           ...response.data,
-          token: finalToken,
+          token: extractedToken || response.data.token,
         };
 
-        await AsyncStorage.setItem("jwt", finalToken);
+        if (result.token) {
+          await AsyncStorage.setItem("jwt", result.token);
+        }
 
         return result;
       } catch (e) {
@@ -3020,6 +3153,7 @@ export async function getLatestGitHubRelease(): Promise<{
   try {
     const response = await axios.get(
       "https://api.github.com/repos/Termix-SSH/Mobile/releases/latest",
+      { timeout: 8000 },
     );
     const release = response.data;
 

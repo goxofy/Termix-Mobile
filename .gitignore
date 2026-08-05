@@ -1,5 +1,10 @@
 node_modules/
 
+# Termix Tailscale native build artifacts (rebuild via npm run build:tailscale-*)
+modules/termix-tailscale/native/libtermix_ts_host.*
+modules/termix-tailscale/ios/lib/
+modules/termix-tailscale/android/src/main/jniLibs/
+
 .expo/
 dist/
 web-build/
