@@ -42,6 +42,7 @@ import {
   getCurrentServerUrl,
   getDisplayServerUrl,
   initializeServerConfig,
+  setRuntimeTransportUrl,
   setCookie,
   getUserInfo,
   loginUser,
@@ -125,9 +126,10 @@ export default function AuthFlow() {
 
   const finishAuthenticated = useCallback(async () => {
     try {
-      await initializeServerConfig();
+      // Preserve live Tailscale localhost forward — full rehydrate tears it down.
+      await initializeServerConfig({ rehydrateTailscale: false });
     } catch {}
-    const url = getCurrentServerUrl();
+    const url = getDisplayServerUrl() ?? getCurrentServerUrl();
     if (url) setSelectedServer({ name: "Server", ip: url });
     setAuthenticated(true);
     closeAuthFlow();
@@ -249,6 +251,8 @@ export default function AuthFlow() {
         displayUrl = connected.displayUrl;
         viaTailscale = true;
       } else {
+        // Keep any previously saved auth key so cold-start can still offer TS,
+        // but mark TS as not preferred for this save.
         await saveTailscaleSettings({
           enabled: false,
           authKey: tailscaleAuthKey,
@@ -262,12 +266,18 @@ export default function AuthFlow() {
         }
       }
 
+      // Persist the user-facing URL on disk. Runtime transport (localhost forward)
+      // is applied in memory only — otherwise Hosts re-init would treat a dead
+      // 127.0.0.1 port as the server and hang after login.
       await saveServerConfig({
-        serverUrl: transportUrl,
+        serverUrl: displayUrl,
         displayUrl,
         viaTailscale,
         lastUpdated: new Date().toISOString(),
       });
+      if (viaTailscale && transportUrl !== displayUrl) {
+        await setRuntimeTransportUrl(transportUrl);
+      }
       setSelectedServer({ name: "Server", ip: displayUrl });
 
       const ok = await probeServer();
@@ -1238,7 +1248,7 @@ function OidcStep({
           authStartedRef.current = false;
           return;
         }
-        await initializeServerConfig();
+        await initializeServerConfig({ rehydrateTailscale: false });
 
         // Confirm the token, tolerating transient gateway hiccups (502 / brief
         // network blips from the reverse proxy). A real 401 means the token is

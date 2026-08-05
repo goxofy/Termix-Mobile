@@ -209,7 +209,10 @@ export default function Hosts() {
         if (isRefresh) setRefreshing(true);
         else setLoading(true);
 
-        await initializeServerConfig();
+        // Do not force a Tailscale re-join here — that tore down the live
+        // localhost forward after login and caused "loading hosts" to hang.
+        // initializeServerConfig reuses a live forward when present.
+        await initializeServerConfig({ rehydrateTailscale: false });
         if (!getCurrentServerUrl()) {
           toast.error("No server configured. Set one up in Settings.");
           return;

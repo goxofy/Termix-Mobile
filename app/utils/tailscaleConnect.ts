@@ -3,6 +3,7 @@ import {
   closeTermixTailscale,
   configureTermixTailscale,
   isTermixTailscaleAvailable,
+  isTermixTailscaleUp,
   startTermixTailscaleForward,
   stopAllTermixTailscaleForwards,
   upTermixTailscale,
@@ -104,13 +105,43 @@ export function parseServerUrl(url: string): ParsedServerUrl {
   };
 }
 
+function transportUrlFor(
+  forward: ForwardHandle,
+  rest: string,
+): string {
+  return `http://127.0.0.1:${forward.localPort}${rest}`;
+}
+
+/** Live localhost transport if an active forward already targets this display URL. */
+export function getLiveTransportUrl(displayUrl: string): string | null {
+  if (!activeForward) return null;
+  try {
+    const parsed = parseServerUrl(displayUrl);
+    if (
+      activeForward.remoteHost === parsed.host &&
+      activeForward.remotePort === parsed.port
+    ) {
+      return transportUrlFor(activeForward, parsed.rest);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export function getActiveTailscaleForward(): ForwardHandle | null {
+  return activeForward;
+}
+
 /**
  * Bring up userspace Tailscale (if needed) and open a localhost TCP forward
  * to the remote Termix origin. Returns the URL the app should use for axios/WS.
  *
+ * Reuses an existing live forward to the same host:port (critical: Hosts page
+ * re-calls initializeServerConfig after login and must not tear down the tunnel).
+ *
  * Transport is always http://127.0.0.1:<localPort>… because the forward is plain TCP
  * to the remote port (TLS would be end-to-end to 127.0.0.1 and fail hostname checks).
- * Prefer HTTP backends over Tailscale, or terminate TLS on the remote as HTTP for this path.
  */
 export async function connectServerViaTailscale(opts: {
   serverUrl: string;
@@ -128,24 +159,39 @@ export async function connectServerViaTailscale(opts: {
     throw new Error("Tailscale auth key is required");
   }
 
-  await stopAllTermixTailscaleForwards();
-  activeForward = null;
+  // Reuse a healthy forward — do not stop/reconfigure (configure fails once Up).
+  const live = getLiveTransportUrl(parsed.original);
+  if (live && activeForward && (await isTermixTailscaleUp())) {
+    return {
+      transportUrl: live,
+      displayUrl: parsed.original,
+      forward: activeForward,
+    };
+  }
 
-  await configureTermixTailscale({
-    authKey: opts.authKey.trim(),
-    hostname: opts.hostname || "termix-mobile",
-    ephemeral: opts.ephemeral ?? true,
-  });
-  await upTermixTailscale();
+  const alreadyUp = await isTermixTailscaleUp();
+  if (!alreadyUp) {
+    await configureTermixTailscale({
+      authKey: opts.authKey.trim(),
+      hostname: opts.hostname || "termix-mobile",
+      ephemeral: opts.ephemeral ?? true,
+    });
+    await upTermixTailscale();
+  }
+
+  // Drop only stale forwards, then open the one we need.
+  try {
+    await stopAllTermixTailscaleForwards();
+  } catch {
+    // best-effort
+  }
+  activeForward = null;
 
   const forward = await startTermixTailscaleForward(parsed.host, parsed.port);
   activeForward = forward;
 
-  // Local forward is cleartext TCP to the remote port. Use http:// on localhost.
-  const transportUrl = `http://127.0.0.1:${forward.localPort}${parsed.rest}`;
-
   return {
-    transportUrl,
+    transportUrl: transportUrlFor(forward, parsed.rest),
     displayUrl: parsed.original,
     forward,
   };
@@ -168,21 +214,23 @@ export async function shutdownTailscale(): Promise<void> {
   }
 }
 
-export function getActiveTailscaleForward(): ForwardHandle | null {
-  return activeForward;
-}
-
 /**
- * After process restart, rebuild a localhost forward for a previously saved
- * Tailscale-backed display URL using the SecureStore auth key.
- * Returns the new transport URL, or null if Tailscale cannot be rehydrated.
+ * Ensure a localhost forward exists for displayUrl.
+ * Reuses live forwards; otherwise joins with SecureStore auth key.
  */
 export async function rehydrateTailscaleTransport(
   displayUrl: string,
 ): Promise<string | null> {
   if (!isTermixTailscaleAvailable()) return null;
+
+  const live = getLiveTransportUrl(displayUrl);
+  if (live && (await isTermixTailscaleUp())) {
+    return live;
+  }
+
   const settings = await loadTailscaleSettings();
-  if (!settings.enabled || !settings.authKey) return null;
+  if (!settings.authKey) return null;
+
   try {
     const { transportUrl } = await connectServerViaTailscale({
       serverUrl: displayUrl,
@@ -194,4 +242,11 @@ export async function rehydrateTailscaleTransport(
   } catch {
     return null;
   }
+}
+
+/** True when user previously saved a Tailscale auth key for this app. */
+export async function isTailscaleConfigured(): Promise<boolean> {
+  if (!isTermixTailscaleAvailable()) return false;
+  const s = await loadTailscaleSettings();
+  return !!s.authKey.trim();
 }

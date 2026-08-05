@@ -279,44 +279,109 @@ export async function saveServerConfig(config: ServerConfig): Promise<boolean> {
   }
 }
 
-export async function initializeServerConfig(): Promise<void> {
+export type InitializeServerConfigOptions = {
+  /**
+   * When true (default), try to keep/restore a Tailscale localhost forward if
+   * the saved config used Tailscale. Safe to call repeatedly: live forwards are
+   * reused and not torn down.
+   */
+  rehydrateTailscale?: boolean;
+};
+
+/**
+ * Load server config into memory and refresh axios bases.
+ *
+ * IMPORTANT: Hosts and other screens call this often. It must NOT destroy an
+ * already-working Tailscale localhost forward (that was the "loading hosts"
+ * hang after login).
+ */
+export async function initializeServerConfig(
+  options: InitializeServerConfigOptions = {},
+): Promise<void> {
+  const rehydrateTailscale = options.rehydrateTailscale !== false;
+
   try {
     const configStr = await AsyncStorage.getItem("serverConfig");
 
     if (configStr) {
       const config = JSON.parse(configStr) as ServerConfig;
 
-      if (config?.serverUrl) {
-        configuredServerMeta = config;
-        configuredServerUrl = config.serverUrl;
+      if (config?.serverUrl || config?.displayUrl) {
+        const displayUrl = config.displayUrl || config.serverUrl;
+        configuredServerMeta = { ...config, displayUrl };
+        configuredServerUrl = config.serverUrl || displayUrl;
 
-        // Localhost forwards die with the process. Re-bind via Tailscale when possible.
-        if (config.viaTailscale && config.displayUrl) {
+        // Prefer a live Tailscale forward over stale localhost ports from disk.
+        if (displayUrl) {
           try {
-            const { rehydrateTailscaleTransport } = await import(
-              "./utils/tailscaleConnect"
-            );
-            const transportUrl = await rehydrateTailscaleTransport(
-              config.displayUrl,
-            );
-            if (transportUrl) {
-              configuredServerUrl = transportUrl;
+            const {
+              getLiveTransportUrl,
+              rehydrateTailscaleTransport,
+              isTailscaleConfigured,
+            } = await import("./utils/tailscaleConnect");
+
+            const live = getLiveTransportUrl(displayUrl);
+            if (live) {
+              configuredServerUrl = live;
               configuredServerMeta = {
-                ...config,
-                serverUrl: transportUrl,
-                lastUpdated: new Date().toISOString(),
+                ...configuredServerMeta,
+                serverUrl: live,
+                displayUrl,
+                viaTailscale: true,
               };
-              await AsyncStorage.setItem(
-                "serverConfig",
-                JSON.stringify(configuredServerMeta),
-              );
-            } else {
-              // Fall back to the real display URL so the user can still try direct LAN
-              // or re-open the auth flow with Tailscale.
-              configuredServerUrl = config.displayUrl;
+            } else if (
+              rehydrateTailscale &&
+              (config.viaTailscale || (await isTailscaleConfigured()))
+            ) {
+              // Only auto-rejoin when the last session used TS, or when the
+              // caller explicitly wants rehydrate (boot path handles chooser).
+              if (config.viaTailscale) {
+                const transportUrl =
+                  await rehydrateTailscaleTransport(displayUrl);
+                if (transportUrl) {
+                  configuredServerUrl = transportUrl;
+                  configuredServerMeta = {
+                    ...configuredServerMeta,
+                    serverUrl: transportUrl,
+                    displayUrl,
+                    viaTailscale: true,
+                    lastUpdated: new Date().toISOString(),
+                  };
+                  // Persist transport only for crash recovery hints; displayUrl stays.
+                  await AsyncStorage.setItem(
+                    "serverConfig",
+                    JSON.stringify({
+                      ...configuredServerMeta,
+                      // Store display as serverUrl fallback so cold start without
+                      // rehydrate still has a usable absolute URL.
+                      serverUrl: displayUrl,
+                      displayUrl,
+                      viaTailscale: true,
+                    }),
+                  );
+                } else {
+                  // Keep memory pointing at display URL for direct attempt; do not
+                  // wipe viaTailscale capability from disk permanently here.
+                  configuredServerUrl = displayUrl;
+                  configuredServerMeta = {
+                    ...configuredServerMeta,
+                    serverUrl: displayUrl,
+                    displayUrl,
+                    viaTailscale: false,
+                  };
+                }
+              }
+            } else if (
+              configuredServerUrl?.includes("127.0.0.1") &&
+              displayUrl &&
+              !live
+            ) {
+              // Stale localhost from a previous process — fall back to display.
+              configuredServerUrl = displayUrl;
               configuredServerMeta = {
-                ...config,
-                serverUrl: config.displayUrl,
+                ...configuredServerMeta,
+                serverUrl: displayUrl,
+                displayUrl,
                 viaTailscale: false,
               };
             }
@@ -328,12 +393,15 @@ export async function initializeServerConfig(): Promise<void> {
                 error: e instanceof Error ? e.message : String(e),
               },
             );
-            configuredServerUrl = config.displayUrl;
-            configuredServerMeta = {
-              ...config,
-              serverUrl: config.displayUrl,
-              viaTailscale: false,
-            };
+            if (displayUrl) {
+              configuredServerUrl = displayUrl;
+              configuredServerMeta = {
+                ...configuredServerMeta!,
+                serverUrl: displayUrl,
+                displayUrl,
+                viaTailscale: false,
+              };
+            }
           }
         }
 
@@ -345,6 +413,85 @@ export async function initializeServerConfig(): Promise<void> {
     systemLogger.error("[initializeServerConfig] Failed to load server config", error, {
       operation: "initialize_server_config",
     });
+  }
+}
+
+/**
+ * Apply transport for the session: direct display URL, or Tailscale forward.
+ * Persists displayUrl + viaTailscale preference without requiring re-entry.
+ */
+export async function applyServerTransportMode(
+  mode: "direct" | "tailscale",
+): Promise<boolean> {
+  const displayUrl =
+    configuredServerMeta?.displayUrl ||
+    configuredServerMeta?.serverUrl ||
+    configuredServerUrl;
+  if (!displayUrl || displayUrl.includes("127.0.0.1")) {
+    // Need a real remote origin; refuse to treat localhost as display URL.
+    if (!configuredServerMeta?.displayUrl) return false;
+  }
+  const origin =
+    configuredServerMeta?.displayUrl ||
+    (!displayUrl.includes("127.0.0.1") ? displayUrl : null);
+  if (!origin) return false;
+
+  try {
+    if (mode === "direct") {
+      const { disconnectTailscaleForwards } = await import(
+        "./utils/tailscaleConnect"
+      );
+      try {
+        await disconnectTailscaleForwards();
+      } catch {
+        // optional
+      }
+      configuredServerUrl = origin;
+      configuredServerMeta = {
+        serverUrl: origin,
+        displayUrl: origin,
+        viaTailscale: false,
+        lastUpdated: new Date().toISOString(),
+      };
+      await AsyncStorage.setItem(
+        "serverConfig",
+        JSON.stringify(configuredServerMeta),
+      );
+      updateApiInstances();
+      await detectAndUpdateApiInstances();
+      return true;
+    }
+
+    const { rehydrateTailscaleTransport, loadTailscaleSettings } = await import(
+      "./utils/tailscaleConnect"
+    );
+    const settings = await loadTailscaleSettings();
+    if (!settings.authKey) return false;
+
+    const transportUrl = await rehydrateTailscaleTransport(origin);
+    if (!transportUrl) return false;
+
+    // Disk keeps the real origin; memory uses localhost transport.
+    configuredServerMeta = {
+      serverUrl: origin,
+      displayUrl: origin,
+      viaTailscale: true,
+      lastUpdated: new Date().toISOString(),
+    };
+    await AsyncStorage.setItem(
+      "serverConfig",
+      JSON.stringify(configuredServerMeta),
+    );
+    configuredServerUrl = transportUrl;
+    updateApiInstances();
+    await detectAndUpdateApiInstances();
+    return true;
+  } catch (e) {
+    systemLogger.warn("[applyServerTransportMode] failed", {
+      operation: "apply_server_transport_mode",
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
   }
 }
 
@@ -363,6 +510,18 @@ export function getDisplayServerUrl(): string | null {
 
 export function getServerConfigMeta(): ServerConfig | null {
   return configuredServerMeta;
+}
+
+/**
+ * Point axios/WS at a transport URL without rewriting the persisted display URL.
+ * Used after Tailscale local-forward setup (http://127.0.0.1:port).
+ */
+export async function setRuntimeTransportUrl(
+  transportUrl: string,
+): Promise<void> {
+  configuredServerUrl = transportUrl.replace(/\/$/, "");
+  updateApiInstances();
+  await detectAndUpdateApiInstances();
 }
 
 /**
