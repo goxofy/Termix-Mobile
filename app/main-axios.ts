@@ -263,11 +263,14 @@ export function setAuthStateCallback(
 }
 
 let configuredServerUrl: string | null = null;
+/** Full last-saved config (includes displayUrl / viaTailscale when set). */
+let configuredServerMeta: ServerConfig | null = null;
 
 export async function saveServerConfig(config: ServerConfig): Promise<boolean> {
   try {
     await AsyncStorage.setItem("serverConfig", JSON.stringify(config));
     configuredServerUrl = config.serverUrl;
+    configuredServerMeta = config;
     updateApiInstances();
     await detectAndUpdateApiInstances();
     return true;
@@ -281,10 +284,59 @@ export async function initializeServerConfig(): Promise<void> {
     const configStr = await AsyncStorage.getItem("serverConfig");
 
     if (configStr) {
-      const config = JSON.parse(configStr);
+      const config = JSON.parse(configStr) as ServerConfig;
 
       if (config?.serverUrl) {
+        configuredServerMeta = config;
         configuredServerUrl = config.serverUrl;
+
+        // Localhost forwards die with the process. Re-bind via Tailscale when possible.
+        if (config.viaTailscale && config.displayUrl) {
+          try {
+            const { rehydrateTailscaleTransport } = await import(
+              "./utils/tailscaleConnect"
+            );
+            const transportUrl = await rehydrateTailscaleTransport(
+              config.displayUrl,
+            );
+            if (transportUrl) {
+              configuredServerUrl = transportUrl;
+              configuredServerMeta = {
+                ...config,
+                serverUrl: transportUrl,
+                lastUpdated: new Date().toISOString(),
+              };
+              await AsyncStorage.setItem(
+                "serverConfig",
+                JSON.stringify(configuredServerMeta),
+              );
+            } else {
+              // Fall back to the real display URL so the user can still try direct LAN
+              // or re-open the auth flow with Tailscale.
+              configuredServerUrl = config.displayUrl;
+              configuredServerMeta = {
+                ...config,
+                serverUrl: config.displayUrl,
+                viaTailscale: false,
+              };
+            }
+          } catch (e) {
+            systemLogger.warn(
+              "[initializeServerConfig] Tailscale rehydrate failed",
+              {
+                operation: "initialize_server_config",
+                error: e instanceof Error ? e.message : String(e),
+              },
+            );
+            configuredServerUrl = config.displayUrl;
+            configuredServerMeta = {
+              ...config,
+              serverUrl: config.displayUrl,
+              viaTailscale: false,
+            };
+          }
+        }
+
         updateApiInstances();
         await detectAndUpdateApiInstances();
       }
@@ -298,6 +350,19 @@ export async function initializeServerConfig(): Promise<void> {
 
 export function getCurrentServerUrl(): string | null {
   return configuredServerUrl;
+}
+
+/** User-facing URL (Tailscale remote / LAN), falling back to transport URL. */
+export function getDisplayServerUrl(): string | null {
+  return (
+    configuredServerMeta?.displayUrl ||
+    configuredServerMeta?.serverUrl ||
+    configuredServerUrl
+  );
+}
+
+export function getServerConfigMeta(): ServerConfig | null {
+  return configuredServerMeta;
 }
 
 /**
@@ -358,6 +423,13 @@ export async function clearServerConfig(): Promise<void> {
     await AsyncStorage.removeItem("serverConfig");
     await AsyncStorage.removeItem("server");
     configuredServerUrl = null;
+    configuredServerMeta = null;
+    try {
+      const { shutdownTailscale } = await import("./utils/tailscaleConnect");
+      await shutdownTailscale();
+    } catch {
+      // optional native module
+    }
     systemLogger.info("Server configuration cleared", {
       operation: "clear_server_config",
     });

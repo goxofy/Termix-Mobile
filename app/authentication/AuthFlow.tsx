@@ -22,16 +22,25 @@ import {
   RefreshCw,
   Globe,
   X,
+  Network,
 } from "lucide-react-native";
 import { WebView, WebViewNavigation } from "react-native-webview";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Text, Input, Button, Label } from "@/app/components/ui";
+import { Text, Input, Button, Label, FakeSwitch } from "@/app/components/ui";
 import { useThemeColor } from "@/app/contexts/ThemeContext";
 import { toast } from "@/app/utils/toast";
+import {
+  connectServerViaTailscale,
+  isTailscaleNativeAvailable,
+  loadTailscaleSettings,
+  saveTailscaleSettings,
+  shutdownTailscale,
+} from "@/app/utils/tailscaleConnect";
 import { useAppContext } from "../AppContext";
 import {
   saveServerConfig,
   getCurrentServerUrl,
+  getDisplayServerUrl,
   initializeServerConfig,
   setCookie,
   getUserInfo,
@@ -91,16 +100,28 @@ export default function AuthFlow() {
   // Carries the TOTP temp token between the login and totp steps.
   const totpTempTokenRef = useRef<string>("");
 
-  // Hostname shown in the shared header.
-  const activeHost = (getCurrentServerUrl() ?? serverUrl).replace(
-    /^https?:\/\//,
-    "",
-  );
+  // Optional userspace Tailscale path (native module; no system VPN).
+  const tailscaleAvailable = isTailscaleNativeAvailable();
+  const [useTailscale, setUseTailscale] = useState(false);
+  const [tailscaleAuthKey, setTailscaleAuthKey] = useState("");
+  const [tailscaleHostname, setTailscaleHostname] = useState("termix-mobile");
+
+  // Hostname shown in the shared header (prefer user-facing display URL).
+  const activeHost = (
+    getDisplayServerUrl() ??
+    getCurrentServerUrl() ??
+    serverUrl
+  ).replace(/^https?:\/\//, "");
 
   useEffect(() => {
-    const current = getCurrentServerUrl();
+    const current = getDisplayServerUrl() ?? getCurrentServerUrl();
     if (current) setServerUrl(current);
-  }, []);
+    void loadTailscaleSettings().then((s) => {
+      setUseTailscale(s.enabled && tailscaleAvailable);
+      if (s.authKey) setTailscaleAuthKey(s.authKey);
+      if (s.hostname) setTailscaleHostname(s.hostname);
+    });
+  }, [tailscaleAvailable]);
 
   const finishAuthenticated = useCallback(async () => {
     try {
@@ -188,6 +209,18 @@ export default function AuthFlow() {
       toast.error("Server address must start with http:// or https://");
       return;
     }
+    if (useTailscale) {
+      if (!tailscaleAvailable) {
+        toast.error(
+          "Tailscale requires a custom native build (termix-tailscale module).",
+        );
+        return;
+      }
+      if (!tailscaleAuthKey.trim()) {
+        toast.error("Enter a Tailscale auth key (tskey-auth-…)");
+        return;
+      }
+    }
 
     setBusy(true);
     try {
@@ -196,15 +229,54 @@ export default function AuthFlow() {
       // login is shown and a subsequent sign-in can't resolve to the old account.
       await clearSession();
 
+      let transportUrl = url;
+      let displayUrl = url;
+      let viaTailscale = false;
+
+      if (useTailscale) {
+        await saveTailscaleSettings({
+          enabled: true,
+          authKey: tailscaleAuthKey,
+          hostname: tailscaleHostname,
+        });
+        const connected = await connectServerViaTailscale({
+          serverUrl: url,
+          authKey: tailscaleAuthKey,
+          hostname: tailscaleHostname,
+          ephemeral: true,
+        });
+        transportUrl = connected.transportUrl;
+        displayUrl = connected.displayUrl;
+        viaTailscale = true;
+      } else {
+        await saveTailscaleSettings({
+          enabled: false,
+          authKey: tailscaleAuthKey,
+          hostname: tailscaleHostname,
+        });
+        // Drop any previous userspace node so direct mode is clean.
+        try {
+          await shutdownTailscale();
+        } catch {
+          // optional
+        }
+      }
+
       await saveServerConfig({
-        serverUrl: url,
+        serverUrl: transportUrl,
+        displayUrl,
+        viaTailscale,
         lastUpdated: new Date().toISOString(),
       });
-      setSelectedServer({ name: "Server", ip: url });
+      setSelectedServer({ name: "Server", ip: displayUrl });
 
       const ok = await probeServer();
       if (!ok) {
-        toast.error("Could not reach that server");
+        toast.error(
+          viaTailscale
+            ? "Could not reach that server over Tailscale. Check auth key, ACL, and subnet routes."
+            : "Could not reach that server",
+        );
       }
     } catch (e: any) {
       toast.error(errMessage(e, "Could not reach that server"));
@@ -335,6 +407,13 @@ export default function AuthFlow() {
                   busy={busy}
                   onConnect={handleConnect}
                   color={color}
+                  tailscaleAvailable={tailscaleAvailable}
+                  useTailscale={useTailscale}
+                  setUseTailscale={setUseTailscale}
+                  tailscaleAuthKey={tailscaleAuthKey}
+                  setTailscaleAuthKey={setTailscaleAuthKey}
+                  tailscaleHostname={tailscaleHostname}
+                  setTailscaleHostname={setTailscaleHostname}
                 />
               )}
 
@@ -406,12 +485,26 @@ function ServerStep({
   busy,
   onConnect,
   color,
+  tailscaleAvailable,
+  useTailscale,
+  setUseTailscale,
+  tailscaleAuthKey,
+  setTailscaleAuthKey,
+  tailscaleHostname,
+  setTailscaleHostname,
 }: {
   serverUrl: string;
   setServerUrl: (v: string) => void;
   busy: boolean;
   onConnect: () => void;
   color: ReturnType<typeof useThemeColor>;
+  tailscaleAvailable: boolean;
+  useTailscale: boolean;
+  setUseTailscale: (v: boolean) => void;
+  tailscaleAuthKey: string;
+  setTailscaleAuthKey: (v: string) => void;
+  tailscaleHostname: string;
+  setTailscaleHostname: (v: string) => void;
 }) {
   return (
     <>
@@ -419,7 +512,11 @@ function ServerStep({
         <Label>Server Address</Label>
         <View className="mt-2">
           <Input
-            placeholder="https://termix.example.com"
+            placeholder={
+              useTailscale
+                ? "http://100.x.y.z:8080 or http://192.168.x.x:PORT"
+                : "https://termix.example.com"
+            }
             value={serverUrl}
             onChangeText={setServerUrl}
             autoCapitalize="none"
@@ -435,7 +532,82 @@ function ServerStep({
         <Text className="mt-2 text-[11px] text-muted-foreground">
           Enter the address of your self-hosted Termix server, including http://
           or https://.
+          {useTailscale
+            ? " With Tailscale, prefer a 100.x / MagicDNS host, or a LAN IP only if a subnet router advertises that range."
+            : ""}
         </Text>
+
+        <View className="mt-4 border-t border-border pt-4">
+          <View className="flex-row items-center justify-between gap-3">
+            <View className="min-w-0 flex-1 flex-row items-center gap-2">
+              <Network size={15} color={color("muted-foreground")} />
+              <View className="min-w-0 flex-1">
+                <Text weight="medium" className="text-sm text-foreground">
+                  Connect via Tailscale
+                </Text>
+                <Text className="text-[10px] text-muted-foreground">
+                  {tailscaleAvailable
+                    ? "Userspace node in-app (no system VPN)"
+                    : "Needs custom native build"}
+                </Text>
+              </View>
+            </View>
+            <FakeSwitch
+              checked={useTailscale && tailscaleAvailable}
+              onChange={(v) => {
+                if (!tailscaleAvailable) {
+                  toast.error(
+                    "Rebuild the app with the termix-tailscale native module to enable this.",
+                  );
+                  return;
+                }
+                setUseTailscale(v);
+              }}
+              disabled={busy}
+            />
+          </View>
+
+          {useTailscale && tailscaleAvailable ? (
+            <View className="mt-3 gap-3">
+              <View>
+                <Label>Auth key</Label>
+                <View className="mt-1.5">
+                  <Input
+                    placeholder="tskey-auth-…"
+                    value={tailscaleAuthKey}
+                    onChangeText={setTailscaleAuthKey}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoComplete="off"
+                    editable={!busy}
+                    leading={
+                      <KeyRound size={16} color={color("muted-foreground")} />
+                    }
+                  />
+                </View>
+                <Text className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
+                  Prefer a short-lived or one-off key. Stored in the device
+                  keychain. LAN IPs require an approved subnet route on your
+                  tailnet.
+                </Text>
+              </View>
+              <View>
+                <Label>Node hostname (optional)</Label>
+                <View className="mt-1.5">
+                  <Input
+                    placeholder="termix-mobile"
+                    value={tailscaleHostname}
+                    onChangeText={setTailscaleHostname}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    editable={!busy}
+                  />
+                </View>
+              </View>
+            </View>
+          ) : null}
+        </View>
+
         <Button
           variant="accent"
           size="lg"
@@ -443,7 +615,11 @@ function ServerStep({
           loading={busy}
           onPress={onConnect}
         >
-          {busy ? "Connecting…" : "Continue"}
+          {busy
+            ? useTailscale
+              ? "Joining Tailscale…"
+              : "Connecting…"
+            : "Continue"}
         </Button>
       </View>
 
@@ -456,6 +632,9 @@ function ServerStep({
         <Text className="flex-1 text-[10px] leading-4 text-muted-foreground">
           Using a self-signed certificate? Install its root CA on your device
           first. Local HTTP servers are supported.
+          {useTailscale
+            ? " Tailscale forwards use cleartext TCP to the remote port via localhost — prefer HTTP on the private backend."
+            : ""}
         </Text>
       </View>
     </>

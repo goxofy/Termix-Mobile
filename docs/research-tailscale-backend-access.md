@@ -1,8 +1,22 @@
 # Research: In-app Tailscale → private Termix backend
 
 **Branch:** `research/tailscale-backend-access`  
-**Date:** 2026-08-05 (rev 2 — corrected after libtailscale / scrcpy-mobile review)  
+**Date:** 2026-08-05 (rev 3 — implementation landed on this branch)  
 **Goal:** User joins a Tailscale tailnet with an auth key **inside Termix**, then reaches a private backend such as `http://192.168.5.166:PORT` (or a `100.x` / MagicDNS host).
+
+## Implementation status (this branch)
+
+| Piece | Status |
+|---|---|
+| `modules/termix-tailscale` Expo module | ✅ scaffold (iOS bridge + stub; Android load-only) |
+| Go `tsnet` local TCP forward (`TermixTS_*`) | ✅ compiles as host c-archive |
+| AuthFlow toggle + auth key (SecureStore) | ✅ |
+| `serverUrl` → `http://127.0.0.1:<port>` transport | ✅ |
+| Cold-start rehydrate | ✅ best-effort via SecureStore key |
+| iOS device `.a` in CI / local Xcode | ⬜ run `npm run build:tailscale-ios` then `npx expo prebuild` / EAS |
+| Android full JNI | ⬜ follow-up |
+
+See `modules/termix-tailscale/README.md`.
 
 ---
 

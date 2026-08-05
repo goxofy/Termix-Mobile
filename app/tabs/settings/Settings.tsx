@@ -26,7 +26,10 @@ import {
   getUserInfo,
   getVersionInfo,
   getCurrentServerUrl,
+  getDisplayServerUrl,
+  getServerConfigMeta,
 } from "@/app/main-axios";
+import { isTailscaleNativeAvailable } from "@/app/utils/tailscaleConnect";
 import { Screen } from "@/app/components/Screen";
 import { LockScreen } from "@/app/components/LockScreen";
 import {
@@ -69,7 +72,10 @@ export default function Settings() {
   const [totpEnabled, setTotpEnabled] = useState(false);
   const [version, setVersion] = useState("");
   const [serverUrl, setServerUrl] = useState<string>(
-    () => getCurrentServerUrl() ?? "",
+    () => getDisplayServerUrl() ?? getCurrentServerUrl() ?? "",
+  );
+  const [viaTailscale, setViaTailscale] = useState(
+    () => !!getServerConfigMeta()?.viaTailscale,
   );
   const [open, setOpen] = useState<string | null>("appearance");
 
@@ -86,7 +92,8 @@ export default function Settings() {
   // unchanged, so we can't rely on that alone).
   useEffect(() => {
     if (authFlowVisible) return;
-    setServerUrl(getCurrentServerUrl() ?? "");
+    setServerUrl(getDisplayServerUrl() ?? getCurrentServerUrl() ?? "");
+    setViaTailscale(!!getServerConfigMeta()?.viaTailscale);
     if (!isAuthenticated) {
       setUsername("—");
       setIsAdmin(false);
@@ -205,11 +212,21 @@ export default function Settings() {
               </View>
               <Text className="text-[11px] text-muted-foreground">
                 {isAuthenticated
-                  ? "Connected"
+                  ? viaTailscale
+                    ? "Connected via Tailscale"
+                    : "Connected"
                   : serverUrl
-                    ? "Configured but not signed in"
+                    ? viaTailscale
+                      ? "Configured via Tailscale (not signed in)"
+                      : "Configured but not signed in"
                     : "No server added yet"}
               </Text>
+              {viaTailscale ? (
+                <Text className="text-[10px] text-muted-foreground">
+                  Transport: localhost forward
+                  {isTailscaleNativeAvailable() ? "" : " (native module missing)"}
+                </Text>
+              ) : null}
             </View>
 
             <Button
