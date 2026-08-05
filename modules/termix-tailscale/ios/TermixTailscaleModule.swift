@@ -13,56 +13,41 @@ public class TermixTailscaleModule: Module {
       TermixTSBridge.defaultStateDir()
     }
 
+    // ObjC methods ending in NSError** import into Swift as `throws`
+    // (do not pass an `error:` argument).
+
     AsyncFunction("configure") { (options: [String: Any]) in
       let authKey = options["authKey"] as? String ?? ""
       let hostname = options["hostname"] as? String ?? "termix-mobile"
       let stateDir = options["stateDir"] as? String ?? TermixTSBridge.defaultStateDir()
       let ephemeral = options["ephemeral"] as? Bool ?? false
 
-      var error: NSError?
-      let ok = TermixTSBridge.configure(
+      try TermixTSBridge.configure(
         withAuthKey: authKey,
         hostname: hostname,
         stateDir: stateDir,
-        ephemeral: ephemeral,
-        error: &error
+        ephemeral: ephemeral
       )
-      if !ok {
-        throw error ?? makeError("configure failed")
-      }
     }
 
     AsyncFunction("up") {
-      var error: NSError?
-      let ok = TermixTSBridge.upWithError(&error)
-      if !ok {
-        throw error ?? makeError("up failed")
-      }
+      try TermixTSBridge.up()
     }
 
     AsyncFunction("startForward") { (remoteHost: String, remotePort: Int) -> Int in
-      var error: NSError?
-      guard let port = TermixTSBridge.startForward(
+      let port = try TermixTSBridge.startForward(
         toHost: remoteHost,
-        port: Int32(remotePort),
-        error: &error
-      ) else {
-        throw error ?? makeError("startForward failed")
-      }
+        port: Int32(remotePort)
+      )
       return port.intValue
     }
 
     AsyncFunction("stopForward") { (remoteHost: String, remotePort: Int, localPort: Int) in
-      var error: NSError?
-      let ok = TermixTSBridge.stopForward(
+      try TermixTSBridge.stopForward(
         toHost: remoteHost,
         port: Int32(remotePort),
-        localPort: Int32(localPort),
-        error: &error
+        localPort: Int32(localPort)
       )
-      if !ok {
-        throw error ?? makeError("stopForward failed")
-      }
     }
 
     AsyncFunction("stopAllForwards") {
@@ -81,12 +66,4 @@ public class TermixTailscaleModule: Module {
       TermixTSBridge.close()
     }
   }
-}
-
-private func makeError(_ message: String) -> NSError {
-  NSError(
-    domain: "TermixTailscale",
-    code: 1,
-    userInfo: [NSLocalizedDescriptionKey: message]
-  )
 }
