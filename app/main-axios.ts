@@ -435,14 +435,12 @@ export async function applyServerTransportMode(
     configuredServerMeta?.displayUrl ||
     configuredServerMeta?.serverUrl ||
     configuredServerUrl;
-  if (!displayUrl || displayUrl.includes("127.0.0.1")) {
-    // Need a real remote origin; refuse to treat localhost as display URL.
-    if (!configuredServerMeta?.displayUrl) return false;
-  }
+  // Need a real remote origin; refuse to treat localhost as display URL.
   const origin =
-    configuredServerMeta?.displayUrl ||
-    (!displayUrl.includes("127.0.0.1") ? displayUrl : null);
-  if (!origin) return false;
+    (configuredServerMeta?.displayUrl || displayUrl || "").trim() || null;
+  if (!origin || origin.includes("127.0.0.1")) {
+    return false;
+  }
 
   try {
     if (mode === "direct") {
