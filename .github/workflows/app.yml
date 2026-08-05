@@ -49,6 +49,28 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Userspace Tailscale (tsnet) C archive for iOS — must exist before prebuild/pods.
+      - name: Setup Go
+        if: matrix.platform == 'apple'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: modules/termix-tailscale/native/go.sum
+
+      - name: Setup Xcode
+        if: matrix.platform == 'apple'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build Termix Tailscale iOS archive
+        if: matrix.platform == 'apple'
+        run: |
+          set -euo pipefail
+          make -C modules/termix-tailscale/native ios
+          test -f modules/termix-tailscale/ios/lib/libtermix_ts.a
+          ls -lh modules/termix-tailscale/ios/lib/
+
       - name: Validate EAS configuration
         run: |
           echo "EAS configuration:"
