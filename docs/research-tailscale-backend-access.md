@@ -1,299 +1,372 @@
 # Research: In-app Tailscale → private Termix backend
 
-**Branch:** `research/tailscale-backend-access` (worktree: `worktree-research-tailscale-backend-access`)  
-**Date:** 2026-08-05  
-**Goal:** Let a mobile user join a Tailscale tailnet (via key), then reach a Termix backend that is **not** exposed on the public internet — e.g. `http://192.168.5.166:PORT`.
+**Branch:** `research/tailscale-backend-access`  
+**Date:** 2026-08-05 (rev 2 — corrected after libtailscale / scrcpy-mobile review)  
+**Goal:** User joins a Tailscale tailnet with an auth key **inside Termix**, then reaches a private backend such as `http://192.168.5.166:PORT` (or a `100.x` / MagicDNS host).
 
 ---
 
-## 1. Problem statement
+## 0. Correction vs first draft
 
-Today Termix Mobile is a thin client of a self-hosted Termix server:
+First draft over-weighted “full system VPN / rewrite all RN networking” and under-weighted the **official embed path**:
+
+| Source | What it gives us |
+|---|---|
+| [tailscale/libtailscale](https://github.com/tailscale/libtailscale) | Official **C library** wrapping userspace `tsnet`. Auth key, dial/listen, **loopback SOCKS5**, iOS static archives + **TailscaleKit** (Swift). |
+| [wsvn53/scrcpy-mobile](https://github.com/wsvn53/scrcpy-mobile) | **Shipped App Store product** pattern: embed TS → `startForward(remoteHost, remotePort, localPort)` → app talks to **`127.0.0.1:localPort`** as if it were the remote. |
+
+That pattern is **much simpler** than Network Extension / VpnService. It does **not** require hijacking the whole device network stack.
+
+---
+
+## 1. What we actually want (simple mental model)
 
 ```
-Phone → (must route to) → Termix HTTP/WS origin → proxies SSH/RDP/Docker/…
+┌─────────────────────────────────────────────────────────┐
+│ Termix Mobile                                           │
+│                                                         │
+│  1) libtailscale / tsnet  up(authKey)                   │
+│        → phone becomes a node on the tailnet            │
+│                                                         │
+│  2) local port forward                                  │
+│        127.0.0.1:2xxxx  ──tsnet.Dial──►  target:PORT    │
+│        target = 100.x / MagicDNS / (via subnet) 192.168 │
+│                                                         │
+│  3) existing app code unchanged in spirit:              │
+│        serverUrl = http://127.0.0.1:2xxxx               │
+│        axios / WebSocket / (most) traffic → localhost   │
+│        which is bridged onto the tailnet                │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Server address is a single `serverUrl` (`http(s)://host:port`) entered in AuthFlow and stored in AsyncStorage. There is **no** VPN / Tailscale / tunnel code in the app.
+User-facing flow:
 
-Users on cellular / foreign Wi‑Fi cannot reach a LAN-only backend unless something bridges that path. Tailscale is the natural bridge.
+1. Paste **Tailscale auth key** (and optional hostname).
+2. App brings up embedded node (`tailscale_up` / `TailscaleNode.up()`).
+3. User enters backend as today: `http://192.168.5.166:8080` or `http://termix.tailnet.ts.net`.
+4. App **does not** open that host directly from JS. It:
+   - parses host + port  
+   - starts forward → free local port  
+   - sets effective `serverUrl` to `http://127.0.0.1:<localPort>` (preserve path if any)  
+5. Login / SSH WS / etc. hit localhost; Go side dials the real peer over Tailscale.
+
+This is exactly how scrcpy-mobile’s `SessionNetworking` works:
+
+- `useTailscale == false` → direct `host:port`
+- `useTailscale == true` → `ensureConnected()` → `startForward(remote, remotePort, localPort)` → connect to `127.0.0.1:localPort`
 
 ---
 
-## 2. Clarifications (important)
+## 2. Auth key vs API key (still important, but simple)
 
-### 2.1 “TS API key” vs auth key
-
-| Kind | Prefix (typical) | What it does |
-|---|---|---|
-| **Auth key** | `tskey-auth-…` | Joins a **device/node** into the tailnet without browser login. This is what you want for “connect phone into TS network”. |
-| **API access token** | `tskey-api-…` | Calls Tailscale **control plane API** (list devices, create keys, ACLs). Does **not** put the phone on the wire. |
-
-User intent almost certainly means **auth key** (optionally **generated** via API token on a backend you control).
-
-Docs: [Auth keys](https://tailscale.com/kb/1085/auth-keys), [tailscale up](https://tailscale.com/kb/1241/tailscale-up).
-
-### 2.2 `192.168.5.166` is a LAN address, not a Tailscale address
-
-| Address class | Example | How a phone reaches it over TS |
-|---|---|---|
-| Tailscale node IP | `100.x.y.z` | Node runs Tailscale; peer dials CGNAT IP / MagicDNS |
-| MagicDNS | `termix.tailnet-name.ts.net` | Same, name → 100.x |
-| **LAN RFC1918** | `192.168.5.166` | **Requires a subnet router** on that LAN advertising e.g. `192.168.5.0/24`, plus ACL + route approval |
-
-So “enter `http://192.168.5.166:XXX` after joining TS” only works if the tailnet has an approved **subnet route** covering that prefix.  
-Otherwise prefer exposing Termix itself on Tailscale (`100.x` / MagicDNS) and use that as `serverUrl`.
-
-Docs: [Subnet routers](https://tailscale.com/kb/1019/subnets).
-
-### 2.3 What the app actually needs after “on network”
-
-All of these must reach the same origin:
-
-| Traffic | Path today |
+| Kind | Role in this design |
 |---|---|
-| REST | axios → `http(s)://serverUrl/...` |
-| SSH terminal | RN `WebSocket` → `ws(s)://serverUrl/ssh/websocket/?token=` |
-| Docker console | RN `WebSocket` |
-| Guacamole / OIDC | `react-native-webview` (system WebView networking) |
+| **Auth key** `tskey-auth-…` | What the phone stores / uses to join. Primary UX field. |
+| **API / OAuth client** | Optional: scrcpy auto-**mints** short-lived auth keys when the old one expires. Nice-to-have, not required for v1. |
 
-Any Tailscale solution must cover **fetch + WebSocket + WebView**, not only REST.
-
----
-
-## 3. Current app integration points
-
-| Area | File | Notes |
-|---|---|---|
-| Server URL UX | `app/authentication/AuthFlow.tsx` | Validates `/^https?:\/\//`, saves config |
-| Config store | `app/main-axios.ts` `saveServerConfig` / `getCurrentServerUrl` | Single global origin |
-| Type | `types/index.ts` `ServerConfig` | `{ serverUrl, lastUpdated }` |
-| Terminal WS | `app/tabs/sessions/terminal/NativeWebSocketManager.ts` | `new WebSocket(url)` — no custom agent |
-| SSL / cleartext | `plugins/with*` | Cleartext OK; **local SSL bypass is RFC1918/link-local only** — **not** `100.64/10` |
-
-**Implication for Tailscale HTTPS:** self-signed certs on `100.x` / `*.ts.net` will **not** get the existing Android local-hostname SSL bypass. Prefer HTTP on private nets, public CA, or user-installed CA (or extend bypass to CGNAT / MagicDNS).
+v1: user pastes auth key (or admin pre-provisions one).  
+v2: OAuth client id/secret + tag → create ephemeral keys (scrcpy already does this).
 
 ---
 
-## 4. Feasibility of approaches
+## 3. Official building blocks
 
-### Option A — Out-of-process: official Tailscale app (already works)
+### 3.1 libtailscale ([github.com/tailscale/libtailscale](https://github.com/tailscale/libtailscale))
 
-**Flow**
+C API (`tailscale.h`) — essentials:
 
-1. User installs [Tailscale iOS/Android](https://tailscale.com/download).
-2. Joins tailnet (SSO, or admin-issued **auth key** in client UI where supported).
-3. Ensure path to backend:
-   - Termix on a TS node → use `http://100.x.y.z:PORT` or MagicDNS; **or**
-   - Subnet router advertises `192.168.5.0/24` → use `http://192.168.5.166:PORT`.
-4. In Termix Mobile AuthFlow, enter that URL as today.
-
-**Pros**
-
-- Zero Termix code for VPN.
-- Full system VPN: axios, WS, WebView all “just work”.
-- Apple/Google already approved Tailscale’s Network Extension / VpnService.
-- iOS/Android auto-accept subnet routes.
-
-**Cons**
-
-- Two apps; user must enable VPN.
-- Auth key UX lives in Tailscale app, not Termix.
-- Cannot force “must be on TS before login” inside Termix without reachability probes.
-
-**Verdict:** **Supported today.** Best default recommendation for self-hosters.
-
----
-
-### Option B — In-app system VPN (embed Tailscale TUN)
-
-Run Tailscale as a **Packet Tunnel Provider** (iOS Network Extension) / **VpnService** (Android) inside Termix, join with auth key, install routes, then use normal `serverUrl`.
-
-**Pros**
-
-- One app; all traffic types covered.
-- Can gate AuthFlow on “Tailscale connected”.
-
-**Cons / blockers**
-
-- **No official Tailscale mobile embedding SDK** for third-party apps.
-- Would mean vendoring/porting `tailscaled` + platform tunnel plumbing (what Tailscale’s own apps do).
-- iOS: Network Extension entitlement, App Store review, always-on VPN scrutiny, separate extension target, keychain access groups, NE packet APIs.
-- Android: foreground service, VPN consent dialog, OEM battery kills.
-- Binary size, update lag vs upstream Tailscale, security responsibility (you become a VPN vendor).
-- Expo: needs custom dev client + multi-target native project (doable with config plugins, still large).
-
-**Verdict:** **Possible in theory, not practical** without Tailscale partnership or a multi-month native effort. Not recommended as first step.
-
----
-
-### Option C — In-process userspace node (`tsnet` / gVisor) via native Go module
-
-[tsnet](https://pkg.go.dev/tailscale.com/tsnet) embeds a Tailscale node with userspace stack:
-
-```go
-s := &tsnet.Server{Hostname: "termix-mobile", AuthKey: key, Ephemeral: true}
-conn, err := s.Dial(ctx, "tcp", "192.168.5.166:8080")
-// or s.HTTPClient() for HTTP over tailnet
+```c
+tailscale ts = tailscale_new();
+tailscale_set_authkey(ts, "tskey-auth-...");
+tailscale_set_hostname(ts, "termix-mobile");
+tailscale_set_ephemeral(ts, 1);
+tailscale_set_dir(ts, state_dir);
+tailscale_up(ts);                          // join tailnet
+tailscale_dial(ts, "tcp", "100.x.y.z:8080", &conn);  // userspace dial
+tailscale_loopback(ts, addr, ..., proxy_cred, local_api_cred); // SOCKS5 on loopback
 ```
 
-**Auth key:** first-class (`Server.AuthKey` / `TS_AUTHKEY`).
+Also: `listen` / `accept`, `getips`, Funnel helper.
 
-**Critical gap for React Native**
+**Swift (Apple):** `swift/TailscaleKit` — `TailscaleNode`, `OutgoingConnection`, and:
 
-| API | Uses system network stack? | Auto-uses tsnet? |
-|---|---|---|
-| RN `fetch` / axios | Yes | **No** |
-| RN `WebSocket` | Yes | **No** |
-| WebView | Yes | **No** |
-| `tsnet.Dial` / `HTTPClient` | Userspace | Yes, only if you call it |
+```swift
+// Official helper: URLSession → SOCKS5 via node.loopback()
+let (config, _) = try await URLSessionConfiguration.tailscaleSession(node)
+let session = URLSession(configuration: config)
+// requests to https://server....ts.net go over the tailnet
+```
 
-So embedding tsnet alone does **not** make `http://192.168.5.166` work in AuthFlow. You must either:
+Build targets in-tree: **macOS + iOS (+ sim)** archives. Android is **not** first-class in the Makefile (would be `GOOS=android` / NDK c-archive DIY, or a thin Go forwarder like scrcpy’s).
 
-1. **SOCKS5/HTTP proxy local loopback** (`tsnet`/`tailscaled --tun=userspace-networking` style) **and** force every client through it — RN has **poor** first-class SOCKS support for fetch/WS/WebView; or  
-2. **Replace transports**: custom native HTTP + WS that dial via tsnet, and stop using WebView for Guacamole/OIDC (or inject proxy into WebView — platform-specific and fragile); or  
-3. **Userspace TUN + VPN API** — collapses into Option B.
+### 3.2 scrcpy-mobile pattern ([github.com/wsvn53/scrcpy-mobile](https://github.com/wsvn53/scrcpy-mobile))
 
-**gomobile / Expo module**
+They did **not** stop at raw `dial` for the UI layer. They wrapped a small Go library:
 
-- Ship a small Go library: `up(authKey)`, `status()`, `dial(host,port)`, maybe local SOCKS.
-- Android easier than iOS (bitcode/extension/signing).
-- Still need the transport rewrite above.
+`porting/libtsnet` → **libtsnet-forwarder**
 
-**Verdict:** **Technically interesting for a constrained “API-only” path; incomplete for Termix** unless you also rebuild networking. High complexity, medium risk.
+```c
+update_tsnet_auth_key("tskey-auth-...");
+tsnet_connect_async();
+// when up:
+tsnet_start_forward("100.78.206.85", 8000, 8080);
+// app connects to 127.0.0.1:8080
+tsnet_stop_forward(...);
+```
+
+Swift side (`TailscaleManager` / `SessionNetworking`):
+
+1. Configure auth key + hostname + state dir (UserDefaults / Keychain-style settings).
+2. `ensureConnected()` / wait until status OK.
+3. Pick free local port in `20000–30000`.
+4. `startForward(remoteHost, remotePort, localPort)`.
+5. Hand `127.0.0.1:localPort` to the existing scrcpy/ADB client.
+6. Optional: OAuth client regenerates auth key near expiry.
+
+**Why this is elegant for apps like Termix:**
+
+- Existing clients keep using normal TCP/HTTP/WS to **localhost**.
+- No system VPN permission dialog for a full tunnel.
+- No need to teach axios a custom dialer if localhost works.
+- One forward per backend origin is enough for Termix (single `serverUrl`).
 
 ---
 
-### Option D — `@tailscale/connect` (JS + WASM)
+## 4. Mapping onto Termix Mobile
 
-NPM: [`@tailscale/connect`](https://www.npmjs.com/package/@tailscale/connect) — browser Tailscale client from `cmd/tsconnect`.
+### 4.1 Today
 
-| Fact | Detail |
+| Piece | Behavior |
 |---|---|
-| Artifact | `main.wasm` ~**25 MB** uncompressed (~6 MB gz) |
-| Target | Browser / WASM, not RN Hermes native networking |
-| RN | No practical path to route native axios/WS/WebView through it |
+| `AuthFlow` | User enters `http(s)://host:port` |
+| `saveServerConfig` | Stores one `serverUrl` |
+| axios / `fetch` | System stack → that origin |
+| `NativeWebSocketManager` | `new WebSocket(wsUrl)` same host |
+| WebView (OIDC / Guacamole) | System WebView → same host |
 
-**Verdict:** **Not suitable** for Termix Mobile native app.
+### 4.2 With Tailscale (recommended Termix shape)
 
----
+Add a thin native module (Expo module), conceptually:
 
-### Option E — Productized “guided external VPN” (recommended product middle ground)
+```
+modules/termix-tailscale/
+  ios/   → link libtailscale or libtsnet-forwarder.a
+  android/ → same Go c-shared / c-archive via NDK (extra work)
+  src/   → JS API
+```
 
-Don’t embed Tailscale. Add Termix UX that:
+JS API sketch:
 
-1. Documents / deep-links to install Tailscale.
-2. Optional fields: auth-key instructions (or open TS app), expected backend URL templates (`100.x`, MagicDNS, LAN via subnet router).
-3. **Reachability probe** before login (`HEAD /status` with timeout) + clear errors (“not reachable — is Tailscale connected? subnet route approved?”).
-4. Optional: store secondary `serverUrl` candidates (LAN vs TS) and try in order when offline/online — still no VPN code.
+```ts
+type TailscaleConfig = {
+  authKey: string;
+  hostname?: string;
+  ephemeral?: boolean;
+};
 
-**Verdict:** **Best ROI** if Option A is the operational model.
+await Tailscale.configure(config);
+await Tailscale.up();                    // wait until connected
+const { localPort } = await Tailscale.startForward({
+  remoteHost: "192.168.5.166",           // or 100.x / magicdns
+  remotePort: 8080,
+});
+// effective origin for the whole app:
+await saveServerConfig({
+  serverUrl: `http://127.0.0.1:${localPort}`,
+  lastUpdated: new Date().toISOString(),
+  // keep user-facing fields separately for UI:
+  // displayUrl, tailscaleRemoteHost, ...
+});
+```
 
----
+**AuthFlow UX (minimal):**
 
-### Option F — Don’t put phone on TS; put a public edge in front
+1. Toggle: “Connect via Tailscale”
+2. Auth key field (SecureStore, not AsyncStorage)
+3. Backend host field (can stay `http://192.168.5.166:8080` as **display / remote** URL)
+4. On continue: `up` → `startForward` → save **localhost** as transport `serverUrl` → existing `probeServer` / login
 
-Cloudflare Tunnel / Pangolin / reverse proxy with auth (app already has reverse-proxy / OIDC WebView flows). Backend stays private; phone hits a public hostname.
+**Settings:** Tailscale status (IP, MagicDNS, connected), regenerate key, disconnect / stop forwards.
 
-**Verdict:** Already partially supported; orthogonal to Tailscale. Good for users who refuse a second VPN app.
+### 4.3 WebSocket
 
----
+`ws://127.0.0.1:localPort/ssh/websocket/?token=…` works if the forward is raw TCP (it is). Same for Docker console WS.
 
-## 5. Recommended architecture if building *something*
+Path-prefix routing on the Termix reverse proxy is unchanged; only the host:port is localhost.
 
-### Phase 0 — Validate ops path (no app change)
+### 4.4 WebView caveat (real, but bounded)
 
-On the home network:
-
-1. Install Tailscale on the Termix host **or** on a always-on subnet router.
-2. If using LAN IP `192.168.5.166`: advertise `192.168.5.0/24`, approve route, ACL allow.
-3. On phone: official Tailscale app → join → open Termix → `http://192.168.5.166:PORT` (or better `http://100.x:PORT`).
-4. Confirm REST login + SSH WebSocket + one WebView path.
-
-If this fails, in-app embedding will fail the same way (routing/ACL), so fix infra first.
-
-### Phase 1 — UX only (small PR)
-
-- Settings / AuthFlow: “Connecting over Tailscale?” help sheet.
-- Optional URL presets / validation tips for `100.64.0.0/10` and `.ts.net`.
-- Better offline errors from `probeServer`.
-- Consider treating Tailscale CGNAT like “private” for SSL hostname bypass (careful security tradeoff).
-
-### Phase 2 — Only if product requires in-app join
-
-Spike **one** platform first (Android VpnService or tsnet+custom dial for REST-only proof):
-
-1. Auth key in SecureStore (never AsyncStorage).
-2. Ephemeral tagged node (`tag:termix-mobile`) + ACL.
-3. Prefer MagicDNS / 100.x as `serverUrl` after `Up()`.
-4. Measure: binary size, connect time, battery, App Store policy.
-
-Do **not** promise iOS+Android system VPN in one sprint.
-
-### Auth key security (if ever stored in app)
-
-| Practice | Why |
-|---|---|
-| Prefer **one-off** or short-lived keys | Stolen reusable keys enroll attacker devices |
-| Prefer **tagged** + **ephemeral** nodes | ACL as `tag:termix-mobile`, auto-cleanup |
-| Generate keys via **your** backend using TS API token | Phone never holds a powerful reusable key |
-| Store material in **SecureStore** | JWT today is AsyncStorage — don’t repeat for TS keys |
-| Device approval / tailnet lock policies | Org hardening |
-
-Creating keys: admin console or API with OAuth client / API token ([auth keys KB](https://tailscale.com/kb/1085/auth-keys)).
-
----
-
-## 6. Mapping to “user story”
-
-> 用户先连入 tailscale 网络（通过 ts api key），然后再去访问后端 `http://192.168.5.166:XXX`
-
-| Step | Feasible? | How |
+| Feature | Uses | Over localhost forward? |
 |---|---|---|
-| Join tailnet with a key | Yes | Auth key in official TS app, or embed (hard) |
-| Reach `192.168.5.166` | Yes **iff** subnet router + approved routes + ACL | Not automatic from auth key alone |
-| Then use Termix as today | Yes | `serverUrl = http://192.168.5.166:XXX` once OS routes there |
-| All of the above **inside** Termix without second app | **Hard** | No official SDK; system VPN or full transport rewrite |
+| REST + terminal WS | RN networking | Yes |
+| Guacamole / OIDC WebView | WKWebView / Android WebView | **Usually yes** if page URL is also `http://127.0.0.1:port/...` |
+| Absolute redirects to `https://real-host/...` inside OIDC | WebView leaves localhost | **Breaks** unless you also proxy or use system Tailscale |
+
+Mitigations:
+
+- Prefer password / TOTP native login over OIDC when using embedded TS, **or**
+- Keep OIDC on a public URL, **or**
+- Document “use official Tailscale app for OIDC/WebView-heavy setups”.
+
+Guacamole if loaded as `http://127.0.0.1:port/guacamole/...` should be fine.
+
+### 4.5 HTTPS / TLS to localhost
+
+If backend is `https://192.168.5.166` with a cert for that name, terminating on localhost as `https://127.0.0.1` will **fail hostname verification**.
+
+Practical options:
+
+1. Prefer **HTTP** on the private side (Termix already allows cleartext).
+2. Forward as TCP and use `http://127.0.0.1` if Termix speaks cleartext on that port.
+3. If HTTPS is mandatory: terminate differently, or install CA + custom trust (messy on localhost name).
+
+**Recommendation:** document cleartext or MagicDNS with proper certs on the **remote** side only when not rewriting to 127.0.0.1; for the forward pattern, **HTTP to private backends is the happy path**.
 
 ---
 
-## 7. Effort / risk matrix
+## 5. `192.168.5.166` still needs a path on the tailnet
 
-| Approach | Effort | Risk | Covers WS+WebView | Recommend |
-|---|---|---|---|---|
-| A Official TS app + URL | None–docs | Low | Yes | **Yes (default)** |
-| E Guided UX + probes | S | Low | Yes | **Yes** |
-| F Tunnel / reverse proxy | Ops | Low | Yes | Yes (alt) |
-| C tsnet native + custom transport | L–XL | High | Only if rewritten | Spike only |
-| B Full in-app VPN | XL | Very high | Yes | No (unless strategic) |
-| D WASM connect | — | — | No | No |
+Embedding libtailscale does **not** invent a route to arbitrary LAN IPs.
 
----
+| Remote you enter | Requirement |
+|---|---|
+| `100.x.y.z` or `name.ts.net` | Peer (or service) on the same tailnet |
+| `192.168.5.166` | Some node advertises subnet `192.168.5.0/24` (or host route), approved + ACL; **or** Termix host itself runs Tailscale and you use its `100.x` instead |
 
-## 8. Concrete recommendation
+Ops checklist (once):
 
-1. **Treat infra as the feature:** run Termix (or a subnet router) on the tailnet; document auth-key join via official mobile Tailscale; use `100.x`/MagicDNS preferably over raw `192.168.x` unless subnet routes are intentional.
-2. **Ship product polish in Termix** (Phase 1): help copy, reachability errors, maybe dual URL / private-range SSL tweak — **not** a VPN engine.
-3. **Revisit in-app VPN only** if a hard requirement appears (e.g. MDM forbids second VPN app, or consumer SKU must be one-tap). Then budget for native specialists and App Store process; start with Android spike + auth-key-from-backend.
+1. Termix host on TS **or** subnet router on that LAN.
+2. ACL allows `tag:termix-mobile` (or user) → that IP:port.
+3. Phone auth key preferably tagged + ephemeral.
 
 ---
 
-## 9. Open questions for product
+## 6. Platform effort (realistic)
 
-1. Is the backend **only** on LAN (`192.168.5.166`), or can it run Tailscale and use `100.x` / MagicDNS?
-2. Is a **second app** (official Tailscale) acceptable for v1?
-3. Who issues keys — end user admin console, or Termix server mints ephemeral auth keys via TS API?
-4. Multi-user: one shared tagged key vs per-user nodes?
-5. Must Guacamole/OIDC WebView work over the same path on day one?
+| Platform | Path | Effort |
+|---|---|---|
+| **iOS** | Official `libtailscale` iOS `.a` + C bridge Expo module, **or** copy scrcpy `libtsnet-forwarder` iOS build | **Medium** — proven in App Store app |
+| **Android** | Build Go `c-shared`/`c-archive` with NDK; JNI Expo module; same forward API | **Medium–High** — no official android target in libtailscale Makefile, but Go + tsnet is portable |
+| **Expo** | Config plugin: link static lib, headers, Gradle/CMake | Medium |
+| **JS integration** | `ServerConfig` + AuthFlow + forward lifecycle | Small once native exists |
+
+Binary size: expect **several–tens of MB** of native lib (Go + tsnet). Acceptable for a “pro” connectivity feature; gate behind optional native build / dev client (already using `expo-dev-client`).
 
 ---
 
-## 10. References
+## 7. Recommended product plan (simpler than before)
 
-- [Auth keys](https://tailscale.com/kb/1085/auth-keys)
-- [Subnet routers](https://tailscale.com/kb/1019/subnets)
-- [Userspace networking](https://tailscale.com/kb/1112/userspace-networking)
-- [tsnet package](https://pkg.go.dev/tailscale.com/tsnet)
-- [tsconnect / @tailscale/connect](https://github.com/tailscale/tailscale/tree/main/cmd/tsconnect)
-- App networking hub: `app/main-axios.ts`
-- Server entry UX: `app/authentication/AuthFlow.tsx`
+### Phase 0 — Ops proof (same as before, optional)
+
+Official Tailscale app + `serverUrl` to `100.x` or subnet-routed `192.168.x` proves ACL/routes before writing native code.
+
+### Phase 1 — Native spike (iOS first, scrcpy-shaped)
+
+1. Expo module wrapping either:
+   - **A.** scrcpy-style `tsnet_start_forward` (fastest product fit), or  
+   - **B.** stock libtailscale `dial` + a tiny local TCP proxy written in Go/C (same idea).
+2. Auth key in **SecureStore**.
+3. AuthFlow toggle → up → forward → `serverUrl=http://127.0.0.1:port`.
+4. Manual test: login + SSH websocket.
+
+### Phase 2 — Android parity
+
+Same C API surface from one Go package; Android Gradle links `.so`.
+
+### Phase 3 — Polish
+
+- Status UI, key expiry / OAuth mint (optional, scrcpy reference).
+- Multi-forward if ever needed (Termix likely one).
+- Clear errors: auth key invalid, not connected, forward failed, subnet unreachable.
+- Don’t store reusable god-keys; prefer ephemeral tagged keys.
+
+### Not required for v1
+
+- System VPN / Network Extension  
+- Routing **all** phone traffic through TS  
+- `@tailscale/connect` WASM  
+- Rewriting axios around a custom agent if localhost forward works  
+
+---
+
+## 8. Why this is simpler than the first write-up
+
+| Earlier worry | Why scrcpy/libtailscale fixes it |
+|---|---|
+| “RN fetch/WS won’t use tsnet” | They talk to **127.0.0.1**; only the forwarder uses tsnet. |
+| “Need full device VPN” | Userspace node + local TCP proxy is enough. |
+| “No official mobile SDK” | **libtailscale** is official; iOS archives + TailscaleKit exist. scrcpy shows production UX. |
+| “Must rewrite WebSocket stack” | `ws://127.0.0.1:...` is a normal WebSocket. |
+
+Remaining hard parts are **boring engineering**, not research unknowns:
+
+1. Expo native module + link Go static lib (iOS then Android).  
+2. Lifecycle: up/down, re-forward after app resume, single origin.  
+3. UX + SecureStore for auth key.  
+4. Document subnet router when users insist on bare `192.168.x`.  
+5. WebView/OIDC edge cases.
+
+---
+
+## 9. Suggested Termix architecture diagram
+
+```
+User enters:
+  authKey = tskey-auth-...
+  backend = http://192.168.5.166:8080
+
+TermixTailscaleModule
+  configure(authKey)
+  up()
+  startForward("192.168.5.166", 8080) → localPort=23456
+
+main-axios configuredServerUrl
+  = "http://127.0.0.1:23456"
+
+axios  ──HTTP──► 127.0.0.1:23456 ──tsnet──► 192.168.5.166:8080
+WS     ──WS────► 127.0.0.1:23456 ──tsnet──► same
+WebView (if pointed at localhost) ─────────► same
+```
+
+Compare scrcpy:
+
+```
+session.useTailscale
+  → SessionNetworking.setupTailscaleConnection
+  → TailscaleManager.startForward(host, port, localPort)
+  → scrcpy client connects 127.0.0.1:localPort
+```
+
+---
+
+## 10. Open decisions (short)
+
+1. **Ship iOS-only first?** (fastest; libtailscale is strongest there)  
+2. **Vendor scrcpy `libtsnet` forwarder** vs implement forward on top of stock libtailscale?  
+   - Forwarder: copy proven API (`tsnet_start_forward`).  
+   - Stock + small proxy: fewer third-party lines, more work.  
+3. **Default remote address style:** encourage `100.x` / MagicDNS over raw LAN?  
+4. **OIDC over embedded TS:** support / degrade / document?
+
+---
+
+## 11. Bottom line
+
+**Yes — your reading is right, and the first research note was too heavy.**
+
+- [libtailscale](https://github.com/tailscale/libtailscale) = official userspace embed (auth key, dial, loopback SOCKS).  
+- [scrcpy-mobile](https://github.com/wsvn53/scrcpy-mobile) = concrete app pattern: **auth key → connect → local port forward → existing client uses localhost**.  
+- For Termix, that means: **one native module + forward + point `serverUrl` at `127.0.0.1`**, not a system VPN and not a full networking rewrite.  
+- Still need correct tailnet routing for `192.168.5.166` (subnet router or put Termix on TS).  
+- Feasible engineering project; **iOS spike is the right next step**.
+
+---
+
+## 12. References
+
+- [libtailscale](https://github.com/tailscale/libtailscale) — `tailscale.h`, `swift/TailscaleKit`, iOS `c-archive`  
+- [libtailscale Swift README](https://github.com/tailscale/libtailscale/blob/main/swift/README.md) — auth key + `URLSessionConfiguration.tailscaleSession`  
+- [scrcpy-mobile](https://github.com/wsvn53/scrcpy-mobile) — `porting/libtsnet`, `TailscaleManager.swift`, `SessionNetworking.swift`  
+- [Auth keys](https://tailscale.com/kb/1085/auth-keys)  
+- [Subnet routers](https://tailscale.com/kb/1019/subnets)  
+- Termix: `app/main-axios.ts`, `app/authentication/AuthFlow.tsx`
