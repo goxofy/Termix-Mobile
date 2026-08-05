@@ -174,11 +174,7 @@ func acceptLoop(ctx context.Context, entry *forwardEntry) {
 			case <-ctx.Done():
 				return
 			default:
-				// transient; keep going until cancelled
-				if ne, ok := err.(net.Error); ok && ne.Temporary() {
-					time.Sleep(50 * time.Millisecond)
-					continue
-				}
+				// Listener closed or hard accept error — exit loop.
 				return
 			}
 		}

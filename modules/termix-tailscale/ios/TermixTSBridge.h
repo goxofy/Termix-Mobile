@@ -2,25 +2,31 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/**
+ * ObjC façade over the C/Go TermixTS_* API.
+ *
+ * Intentionally avoids NSError** out-params so Swift import is boring and stable:
+ * failure is an NSString message (nil = success), or a dictionary with "error".
+ */
 @interface TermixTSBridge : NSObject
 
-+ (BOOL)configureWithAuthKey:(NSString *)authKey
-                    hostname:(NSString *)hostname
-                    stateDir:(NSString *)stateDir
-                   ephemeral:(BOOL)ephemeral
-                       error:(NSError *_Nullable *_Nullable)error;
+/// nil on success, error message on failure.
++ (NSString * _Nullable)configureWithAuthKey:(NSString *)authKey
+                                    hostname:(NSString *)hostname
+                                    stateDir:(NSString *)stateDir
+                                   ephemeral:(BOOL)ephemeral;
 
-+ (BOOL)upWithError:(NSError *_Nullable *_Nullable)error;
+/// nil on success, error message on failure.
++ (NSString * _Nullable)up;
 
-/// Returns local port on success.
-+ (NSNumber *_Nullable)startForwardToHost:(NSString *)remoteHost
+/// On success: @{ @"localPort": @(n) }. On failure: @{ @"error": @"..." }.
++ (NSDictionary *)startForwardToHost:(NSString *)remoteHost
+                                port:(int)remotePort;
+
+/// nil on success, error message on failure.
++ (NSString * _Nullable)stopForwardToHost:(NSString *)remoteHost
                                      port:(int)remotePort
-                                    error:(NSError *_Nullable *_Nullable)error;
-
-+ (BOOL)stopForwardToHost:(NSString *)remoteHost
-                     port:(int)remotePort
-                localPort:(int)localPort
-                    error:(NSError *_Nullable *_Nullable)error;
+                                localPort:(int)localPort;
 
 + (void)stopAllForwards;
 

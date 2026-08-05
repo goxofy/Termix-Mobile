@@ -3,7 +3,7 @@ require 'json'
 package = JSON.parse(File.read(File.join(__dir__, '..', 'package.json')))
 
 lib_dir = File.join(__dir__, 'lib')
-native_dir = File.join(__dir__, '..', 'native')
+native_dir = File.expand_path(File.join(__dir__, '..', 'native'))
 has_go_archive = File.exist?(File.join(lib_dir, 'libtermix_ts.a'))
 
 Pod::Spec.new do |s|
@@ -21,31 +21,35 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Do NOT set SWIFT_OBJC_BRIDGING_HEADER — CocoaPods builds this as a
-  # framework target, and bridging headers are unsupported there.
-  # TermixTSBridge.h is a public header so Swift in the same module sees it.
+  # No SWIFT_OBJC_BRIDGING_HEADER — CocoaPods framework targets reject it.
+  # TermixTSBridge.h is public so the co-located Swift module can see it.
 
   s.source_files = 'TermixTailscaleModule.swift', 'TermixTSBridge.{h,m}'
   s.public_header_files = 'TermixTSBridge.h'
 
-  common_xcconfig = {
-    'DEFINES_MODULE' => 'YES',
-    'CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES' => 'YES',
-    'OTHER_LDFLAGS' => '-lresolv -framework Security -framework Network -framework CoreFoundation'
-  }
+  # Frameworks commonly required by Go/tsnet on Darwin/iOS.
+  s.frameworks = 'Security', 'Network', 'SystemConfiguration', 'CoreFoundation', 'CFNetwork'
+  s.libraries = 'resolv'
 
   if has_go_archive
+    # Link the Go c-archive once via vendored_libraries only.
+    # Do NOT also -force_load the same .a (duplicate symbols).
+    # TermixTSBridge.m references TermixTS_* so those objects stay live;
+    # if a later link needs Go runtime ctor retention we can revisit.
     s.vendored_libraries = 'lib/libtermix_ts.a'
     s.preserve_paths = 'lib/*'
-    # C API header used only by TermixTSBridge.m (not part of the Swift module).
-    s.pod_target_xcconfig = common_xcconfig.merge(
-      'HEADER_SEARCH_PATHS' => "\"#{lib_dir}\""
-    )
+    s.pod_target_xcconfig = {
+      'DEFINES_MODULE' => 'YES',
+      'CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES' => 'YES',
+      'HEADER_SEARCH_PATHS' => '"$(PODS_TARGET_SRCROOT)/lib"'
+    }
   else
-    # Dev / CI without a prebuilt Go archive: compile the failing stub.
+    # Dev without a prebuilt Go archive: compile the failing stub so the app links.
     s.source_files = 'TermixTailscaleModule.swift', 'TermixTSBridge.{h,m}', '../native/stub.c'
-    s.pod_target_xcconfig = common_xcconfig.merge(
-      'HEADER_SEARCH_PATHS' => "\"#{native_dir}\""
-    )
+    s.pod_target_xcconfig = {
+      'DEFINES_MODULE' => 'YES',
+      'CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES' => 'YES',
+      'HEADER_SEARCH_PATHS' => "\"#{native_dir}\" \"$(PODS_TARGET_SRCROOT)/../native\""
+    }
   end
 end

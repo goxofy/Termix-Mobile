@@ -37,6 +37,9 @@ jobs:
           set -euo pipefail
           make -C modules/termix-tailscale/native ios
           test -f modules/termix-tailscale/ios/lib/libtermix_ts.a
+          test -f modules/termix-tailscale/ios/lib/termix_ts.h
+          # Ensure symbols we call from ObjC are present in the archive.
+          nm -gU modules/termix-tailscale/ios/lib/libtermix_ts.a | grep -E 'TermixTS_(Configure|Up|StartForward|Close)'
           ls -lh modules/termix-tailscale/ios/lib/
 
       - name: Generate iOS project

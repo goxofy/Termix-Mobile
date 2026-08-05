@@ -1,64 +1,61 @@
 #import "TermixTSBridge.h"
 #import "termix_ts.h"
 
-static NSError *TermixTSError(void) {
+static NSString *TermixTSLastErrorString(void) {
   char *msg = TermixTS_LastError();
-  NSString *text = msg ? [NSString stringWithUTF8String:msg] : @"unknown error";
-  if (msg) TermixTS_FreeString(msg);
-  return [NSError errorWithDomain:@"TermixTailscale"
-                             code:1
-                         userInfo:@{NSLocalizedDescriptionKey : text ?: @"error"}];
+  if (!msg) {
+    return @"unknown error";
+  }
+  NSString *text = [NSString stringWithUTF8String:msg];
+  TermixTS_FreeString(msg);
+  if (text.length == 0) {
+    return @"unknown error";
+  }
+  return text;
 }
 
 @implementation TermixTSBridge
 
-+ (BOOL)configureWithAuthKey:(NSString *)authKey
-                    hostname:(NSString *)hostname
-                    stateDir:(NSString *)stateDir
-                   ephemeral:(BOOL)ephemeral
-                       error:(NSError **)error {
++ (NSString *)configureWithAuthKey:(NSString *)authKey
+                          hostname:(NSString *)hostname
+                          stateDir:(NSString *)stateDir
+                         ephemeral:(BOOL)ephemeral {
   int rc = TermixTS_Configure(authKey.UTF8String ?: "",
                               hostname.UTF8String ?: "termix-mobile",
                               stateDir.UTF8String ?: "",
                               ephemeral ? 1 : 0);
   if (rc != 0) {
-    if (error) *error = TermixTSError();
-    return NO;
+    return TermixTSLastErrorString();
   }
-  return YES;
+  return nil;
 }
 
-+ (BOOL)upWithError:(NSError **)error {
++ (NSString *)up {
   int rc = TermixTS_Up();
   if (rc != 0) {
-    if (error) *error = TermixTSError();
-    return NO;
+    return TermixTSLastErrorString();
   }
-  return YES;
+  return nil;
 }
 
-+ (NSNumber *)startForwardToHost:(NSString *)remoteHost
-                            port:(int)remotePort
-                           error:(NSError **)error {
++ (NSDictionary *)startForwardToHost:(NSString *)remoteHost
+                                port:(int)remotePort {
   int localPort = 0;
   int rc = TermixTS_StartForward(remoteHost.UTF8String ?: "", remotePort, &localPort);
   if (rc != 0) {
-    if (error) *error = TermixTSError();
-    return nil;
+    return @{@"error" : TermixTSLastErrorString()};
   }
-  return @(localPort);
+  return @{@"localPort" : @(localPort)};
 }
 
-+ (BOOL)stopForwardToHost:(NSString *)remoteHost
-                     port:(int)remotePort
-                localPort:(int)localPort
-                    error:(NSError **)error {
++ (NSString *)stopForwardToHost:(NSString *)remoteHost
+                           port:(int)remotePort
+                      localPort:(int)localPort {
   int rc = TermixTS_StopForward(remoteHost.UTF8String ?: "", remotePort, localPort);
   if (rc != 0) {
-    if (error) *error = TermixTSError();
-    return NO;
+    return TermixTSLastErrorString();
   }
-  return YES;
+  return nil;
 }
 
 + (void)stopAllForwards {
@@ -72,7 +69,9 @@ static NSError *TermixTSError(void) {
 + (NSString *)ips {
   char *raw = TermixTS_GetIPs();
   NSString *s = raw ? [NSString stringWithUTF8String:raw] : @"";
-  if (raw) TermixTS_FreeString(raw);
+  if (raw) {
+    TermixTS_FreeString(raw);
+  }
   return s ?: @"";
 }
 
