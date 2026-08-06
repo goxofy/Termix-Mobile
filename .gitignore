@@ -4,6 +4,8 @@ node_modules/
 modules/termix-tailscale/native/libtermix_ts_host.*
 modules/termix-tailscale/ios/lib/
 modules/termix-tailscale/android/src/main/jniLibs/
+modules/termix-tailscale/android/.cxx/
+modules/termix-tailscale/android/build/
 
 .expo/
 dist/
