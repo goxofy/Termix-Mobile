@@ -1,0 +1,115 @@
+name: Build Android App (GitHub-hosted)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_API_LEVEL: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK_VERSION: "27.1.12297006"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build-android:
+    name: build-android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: modules/termix-tailscale/native/go.sum
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK, NDK, and CMake
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+          test -n "${SDK_ROOT}"
+
+          yes | sdkmanager --sdk_root="${SDK_ROOT}" --licenses >/dev/null || true
+          sdkmanager --sdk_root="${SDK_ROOT}" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+
+          test -d "${SDK_ROOT}/platforms/android-${ANDROID_API_LEVEL}"
+          test -d "${SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
+          test -d "${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          test -d "${SDK_ROOT}/cmake/${CMAKE_VERSION}"
+          {
+            echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+            echo "ANDROID_NDK_ROOT=${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The Android Expo module links this generated Go library through JNI.
+      - name: Build Termix Tailscale Android library
+        run: |
+          set -euo pipefail
+          make -C modules/termix-tailscale/native android
+          test -f modules/termix-tailscale/android/src/main/jniLibs/arm64-v8a/libtermix_ts.so
+          test -f modules/termix-tailscale/android/src/main/jniLibs/termix_ts.h
+          file modules/termix-tailscale/android/src/main/jniLibs/arm64-v8a/libtermix_ts.so
+
+      - name: Generate Android project
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build standalone Android APK
+        run: |
+          set -euo pipefail
+          chmod +x android/gradlew
+          (
+            cd android
+            ./gradlew --no-daemon --stacktrace assembleRelease
+          )
+
+      - name: Verify APK and native libraries
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          test -f "${APK}"
+          unzip -l "${APK}" | grep -F "lib/arm64-v8a/libtermix_ts.so"
+          unzip -l "${APK}" | grep -F "lib/arm64-v8a/libtermix_ts_jni.so"
+          ls -lh "${APK}"
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: termix_android_github_hosted
+          path: android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+          if-no-files-found: error
