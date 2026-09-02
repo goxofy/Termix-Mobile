@@ -123,15 +123,6 @@ jobs:
         if: matrix.platform == 'apple'
         run: npx expo prebuild --platform ios --clean --no-install
 
-      - name: Cache CocoaPods
-        if: matrix.platform == 'apple'
-        uses: actions/cache@v4
-        with:
-          path: ios/Pods
-          key: ${{ runner.os }}-pods-${{ hashFiles('package-lock.json', 'ios/Podfile') }}
-          restore-keys: |
-            ${{ runner.os }}-pods-
-
       - name: Install CocoaPods dependencies
         if: matrix.platform == 'apple'
         run: |
