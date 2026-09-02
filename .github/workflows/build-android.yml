@@ -1,13 +1,23 @@
-name: Build Android App (GitHub-hosted)
+name: Build Mobile Apps (GitHub-hosted)
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        type: choice
+        description: Platform to build for
+        default: "both"
+        required: true
+        options:
+          - both
+          - apple
+          - android
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-build-${{ github.ref }}
+  group: mobile-build-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,14 +27,20 @@ env:
   CMAKE_VERSION: "3.22.1"
 
 jobs:
-  build-android:
-    name: build-android
-    runs-on: ubuntu-latest
+  build:
+    name: build-${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'apple' && 'macos-15' || 'ubuntu-24.04' }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ github.event.inputs.platform == 'both' && fromJSON('["apple", "android"]') || fromJSON(format('["{0}"]', github.event.inputs.platform)) }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -32,22 +48,25 @@ jobs:
           node-version: "20"
           cache: npm
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.24.x"
           cache-dependency-path: modules/termix-tailscale/native/go.sum
 
+      - name: Setup Java
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Setup Android SDK
+        if: matrix.platform == 'android'
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK, NDK, and CMake
+        if: matrix.platform == 'android'
         run: |
           set -euo pipefail
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
@@ -70,11 +89,29 @@ jobs:
             echo "ANDROID_NDK_ROOT=${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           } >> "$GITHUB_ENV"
 
+      - name: Setup Xcode
+        if: matrix.platform == 'apple'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
       - name: Install dependencies
         run: npm ci
 
+      # The iOS Expo module links this archive when CocoaPods runs.
+      - name: Build Termix Tailscale iOS archive
+        if: matrix.platform == 'apple'
+        run: |
+          set -euo pipefail
+          make -C modules/termix-tailscale/native ios
+          test -f modules/termix-tailscale/ios/lib/libtermix_ts.a
+          test -f modules/termix-tailscale/ios/lib/termix_ts.h
+          nm -gU modules/termix-tailscale/ios/lib/libtermix_ts.a | grep -E 'TermixTS_(IsAvailable|Configure|Up|StartForward|Close)'
+          ls -lh modules/termix-tailscale/ios/lib/
+
       # The Android Expo module links this generated Go library through JNI.
       - name: Build Termix Tailscale Android library
+        if: matrix.platform == 'android'
         run: |
           set -euo pipefail
           make -C modules/termix-tailscale/native android
@@ -82,13 +119,83 @@ jobs:
           test -f modules/termix-tailscale/android/src/main/jniLibs/termix_ts.h
           file modules/termix-tailscale/android/src/main/jniLibs/arm64-v8a/libtermix_ts.so
 
+      - name: Generate iOS project
+        if: matrix.platform == 'apple'
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Cache CocoaPods
+        if: matrix.platform == 'apple'
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: ${{ runner.os }}-pods-${{ hashFiles('package-lock.json', 'ios/Podfile') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Install CocoaPods dependencies
+        if: matrix.platform == 'apple'
+        run: |
+          set -euo pipefail
+          cd ios
+          pod install
+
       - name: Generate Android project
+        if: matrix.platform == 'android'
         run: npx expo prebuild --platform android --clean --no-install
 
+      - name: Ensure Android debug keystore
+        if: matrix.platform == 'android'
+        run: |
+          set -euo pipefail
+          if [ ! -f android/app/debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore android/app/debug.keystore \
+              -storetype JKS \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          test -f android/app/debug.keystore
+
       - name: Setup Gradle
+        if: matrix.platform == 'android'
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Build unsigned iOS archive
+        if: matrix.platform == 'apple'
+        run: |
+          set -euo pipefail
+          mkdir -p release build-artifacts
+          (
+            cd ios
+            xcodebuild -workspace Termix.xcworkspace \
+              -scheme Termix \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -archivePath ../release/Termix.xcarchive \
+              archive \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER=""
+          )
+
+          test -d release/Termix.xcarchive/Products/Applications/Termix.app
+          mkdir -p release/Payload
+          cp -R release/Termix.xcarchive/Products/Applications/Termix.app release/Payload/
+          (
+            cd release
+            zip -qr ../build-artifacts/termix_ios_github_hosted.ipa Payload
+          )
+          rm -rf release/Payload release/Termix.xcarchive
+
       - name: Build standalone Android APK
+        if: matrix.platform == 'android'
         run: |
           set -euo pipefail
           chmod +x android/gradlew
@@ -97,7 +204,17 @@ jobs:
             ./gradlew --no-daemon --stacktrace assembleRelease
           )
 
-      - name: Verify APK and native libraries
+      - name: Verify iOS IPA
+        if: matrix.platform == 'apple'
+        run: |
+          set -euo pipefail
+          IPA="build-artifacts/termix_ios_github_hosted.ipa"
+          test -f "${IPA}"
+          unzip -l "${IPA}" | grep -F "Payload/Termix.app/"
+          ls -lh "${IPA}"
+
+      - name: Verify Android APK and native libraries
+        if: matrix.platform == 'android'
         run: |
           set -euo pipefail
           APK="android/app/build/outputs/apk/release/app-release.apk"
@@ -106,7 +223,17 @@ jobs:
           unzip -l "${APK}" | grep -F "lib/arm64-v8a/libtermix_ts_jni.so"
           ls -lh "${APK}"
 
+      - name: Upload iOS IPA
+        if: matrix.platform == 'apple'
+        uses: actions/upload-artifact@v4
+        with:
+          name: termix_ios_github_hosted
+          path: build-artifacts/termix_ios_github_hosted.ipa
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Upload Android APK
+        if: matrix.platform == 'android'
         uses: actions/upload-artifact@v4
         with:
           name: termix_android_github_hosted
