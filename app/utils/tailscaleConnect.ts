@@ -3,7 +3,9 @@ import {
   closeTermixTailscale,
   configureTermixTailscale,
   isTermixTailscaleAvailable,
+  isTermixTailscaleForwardActive,
   isTermixTailscaleUp,
+  probeTermixTailscaleForward,
   startTermixTailscaleForward,
   stopAllTermixTailscaleForwards,
   upTermixTailscale,
@@ -18,12 +20,86 @@ export type ParsedServerUrl = {
   protocol: "http:" | "https:";
   host: string;
   port: number;
-  /** Path + query if present (usually empty for Termix base URL). */
+  /** Optional path prefix (usually empty for a Termix base URL). */
   rest: string;
   original: string;
 };
 
+export type TailscaleTransportErrorCode =
+  | "not_available"
+  | "missing_auth_key"
+  | "invalid_server"
+  | "stale_operation"
+  | "connect_failed";
+
+export class TailscaleTransportError extends Error {
+  constructor(
+    public readonly code: TailscaleTransportErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TailscaleTransportError";
+  }
+}
+
+export type TailscaleTransportResult = {
+  transportUrl: string;
+  displayUrl: string;
+  forward: ForwardHandle;
+  rebuilt: boolean;
+};
+
+type ActiveNodeConfig = {
+  authKey: string;
+  hostname: string;
+  ephemeral: boolean;
+};
+
 let activeForward: ForwardHandle | null = null;
+let activeNodeConfig: ActiveNodeConfig | null = null;
+let tailscaleLifecycleQueue: Promise<void> = Promise.resolve();
+let lifecycleGeneration = 0;
+let recoveryFlight: {
+  displayUrl: string;
+  promise: Promise<TailscaleTransportResult>;
+} | null = null;
+
+function withTailscaleLifecycleLock<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = tailscaleLifecycleQueue;
+  let release!: () => void;
+  tailscaleLifecycleQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return previous
+    .catch(() => undefined)
+    .then(operation)
+    .finally(() => release());
+}
+
+function assertCurrentGeneration(generation: number): void {
+  if (generation !== lifecycleGeneration) {
+    throw new TailscaleTransportError(
+      "stale_operation",
+      "A newer Tailscale transport operation replaced this one.",
+    );
+  }
+}
+
+function asTransportError(error: unknown): TailscaleTransportError {
+  if (error instanceof TailscaleTransportError) return error;
+  const message =
+    error instanceof Error && error.message.trim()
+      ? error.message
+      : "Unable to establish the Tailscale transport.";
+  return new TailscaleTransportError("connect_failed", message);
+}
+
+export function getTailscaleTransportErrorMessage(error: unknown): string {
+  return asTransportError(error).message;
+}
 
 export function isTailscaleNativeAvailable(): boolean {
   return isTermixTailscaleAvailable();
@@ -71,182 +147,338 @@ export async function clearTailscaleSettings(): Promise<void> {
   ]);
 }
 
-/**
- * Parse a Termix server URL into host/port for TCP forwarding.
- * Default ports: http→80, https→443.
- */
+function normalizeHost(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1).toLowerCase()
+    : hostname.toLowerCase();
+}
+
+/** Parse a Termix origin into the target used by the native forward. */
 export function parseServerUrl(url: string): ParsedServerUrl {
-  const trimmed = url.trim().replace(/\/$/, "");
   let parsed: URL;
   try {
-    parsed = new URL(trimmed);
+    parsed = new URL(url.trim());
   } catch {
-    throw new Error("Invalid server URL");
+    throw new TailscaleTransportError("invalid_server", "Invalid server URL.");
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("Server address must start with http:// or https://");
+    throw new TailscaleTransportError(
+      "invalid_server",
+      "Server address must start with http:// or https://.",
+    );
   }
-  const port =
-    parsed.port && parsed.port.length > 0
-      ? Number(parsed.port)
-      : parsed.protocol === "https:"
-        ? 443
-        : 80;
-  if (!Number.isFinite(port) || port <= 0) {
-    throw new Error("Invalid server port");
+  if (!parsed.hostname) {
+    throw new TailscaleTransportError("invalid_server", "Invalid server host.");
   }
-  const rest = `${parsed.pathname === "/" ? "" : parsed.pathname}${parsed.search}`;
+  if (parsed.search || parsed.hash) {
+    throw new TailscaleTransportError(
+      "invalid_server",
+      "Server address must not include query parameters or a fragment.",
+    );
+  }
+
+  const port = parsed.port
+    ? Number(parsed.port)
+    : parsed.protocol === "https:"
+      ? 443
+      : 80;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new TailscaleTransportError("invalid_server", "Invalid server port.");
+  }
+
+  const pathname =
+    parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+  const rest = pathname;
+  const original = `${parsed.origin}${pathname}`;
   return {
     protocol: parsed.protocol,
-    host: parsed.hostname,
+    host: normalizeHost(parsed.hostname),
     port,
     rest,
-    original: trimmed,
+    original,
   };
 }
 
-function transportUrlFor(
-  forward: ForwardHandle,
-  rest: string,
-): string {
+function transportUrlFor(forward: ForwardHandle, rest: string): string {
   return `http://127.0.0.1:${forward.localPort}${rest}`;
 }
 
-/** Live localhost transport if an active forward already targets this display URL. */
-export function getLiveTransportUrl(displayUrl: string): string | null {
-  if (!activeForward) return null;
+function sameForwardTarget(
+  forward: ForwardHandle,
+  parsed: ParsedServerUrl,
+): boolean {
+  return (
+    forward.protocol === parsed.protocol &&
+    normalizeHost(forward.remoteHost) === parsed.host &&
+    forward.remotePort === parsed.port
+  );
+}
+
+async function getLiveTransportUrlUnsafe(
+  displayUrl: string,
+): Promise<string | null> {
+  if (!activeForward || !activeNodeConfig) return null;
+
   try {
     const parsed = parseServerUrl(displayUrl);
-    if (
-      activeForward.remoteHost === parsed.host &&
-      activeForward.remotePort === parsed.port
-    ) {
-      return transportUrlFor(activeForward, parsed.rest);
-    }
+    if (!sameForwardTarget(activeForward, parsed)) return null;
+    if (!(await isTermixTailscaleUp())) return null;
+    if (!(await isTermixTailscaleForwardActive(activeForward))) return null;
+    if (!(await probeTermixTailscaleForward(activeForward))) return null;
+    return transportUrlFor(activeForward, parsed.rest);
   } catch {
     return null;
   }
-  return null;
+}
+
+/** A strongly validated localhost transport for the requested display URL. */
+export function getLiveTransportUrl(
+  displayUrl: string,
+): Promise<string | null> {
+  return withTailscaleLifecycleLock(() =>
+    getLiveTransportUrlUnsafe(displayUrl),
+  );
 }
 
 export function getActiveTailscaleForward(): ForwardHandle | null {
   return activeForward;
 }
 
-/**
- * Bring up userspace Tailscale (if needed) and open a localhost TCP forward
- * to the remote Termix origin. Returns the URL the app should use for axios/WS.
- *
- * Reuses an existing live forward to the same host:port (critical: Hosts page
- * re-calls initializeServerConfig after login and must not tear down the tunnel).
- *
- * Transport is always http://127.0.0.1:<localPort>… because the forward is plain TCP
- * to the remote port (TLS would be end-to-end to 127.0.0.1 and fail hostname checks).
- */
-export async function connectServerViaTailscale(opts: {
+type ConnectServerViaTailscaleOptions = {
   serverUrl: string;
   authKey: string;
   hostname?: string;
   ephemeral?: boolean;
-}): Promise<{ transportUrl: string; displayUrl: string; forward: ForwardHandle }> {
-  if (!isTermixTailscaleAvailable()) {
-    throw new Error(
-      "Tailscale is not available in this build. Use a custom dev client with termix-tailscale native module.",
-    );
-  }
-  const parsed = parseServerUrl(opts.serverUrl);
-  if (!opts.authKey.trim()) {
-    throw new Error("Tailscale auth key is required");
+};
+
+async function shutdownTailscaleUnsafe(): Promise<void> {
+  let stopError: unknown;
+  try {
+    await stopAllTermixTailscaleForwards();
+  } catch (error) {
+    stopError = error;
   }
 
-  // Reuse a healthy forward — do not stop/reconfigure (configure fails once Up).
-  const live = getLiveTransportUrl(parsed.original);
-  if (live && activeForward && (await isTermixTailscaleUp())) {
+  try {
+    await closeTermixTailscale();
+  } finally {
+    activeForward = null;
+    activeNodeConfig = null;
+  }
+
+  if (stopError) throw stopError;
+}
+
+async function connectServerViaTailscaleUnsafe(
+  opts: ConnectServerViaTailscaleOptions,
+  generation: number,
+): Promise<TailscaleTransportResult> {
+  if (!isTermixTailscaleAvailable()) {
+    throw new TailscaleTransportError(
+      "not_available",
+      "Tailscale is not available in this build. Use a custom development or production build with the native module.",
+    );
+  }
+
+  const parsed = parseServerUrl(opts.serverUrl);
+  const authKey = opts.authKey.trim();
+  if (!authKey) {
+    throw new TailscaleTransportError(
+      "missing_auth_key",
+      "Tailscale auth key is required.",
+    );
+  }
+
+  const desiredConfig: ActiveNodeConfig = {
+    authKey,
+    hostname: opts.hostname?.trim() || "termix-mobile",
+    ephemeral: opts.ephemeral ?? true,
+  };
+  const configChanged =
+    activeNodeConfig !== null &&
+    (activeNodeConfig.authKey !== desiredConfig.authKey ||
+      activeNodeConfig.hostname !== desiredConfig.hostname ||
+      activeNodeConfig.ephemeral !== desiredConfig.ephemeral);
+
+  if (configChanged) {
+    await shutdownTailscaleUnsafe();
+    assertCurrentGeneration(generation);
+  }
+
+  let alreadyUp = await isTermixTailscaleUp();
+  assertCurrentGeneration(generation);
+
+  if (!alreadyUp && activeNodeConfig !== null) {
+    await shutdownTailscaleUnsafe();
+    assertCurrentGeneration(generation);
+    alreadyUp = false;
+  } else if (alreadyUp && activeNodeConfig === null) {
+    // Native state can outlive a JS reload. Reconfigure rather than attaching a
+    // forward to a node whose credentials/options cannot be identified.
+    await shutdownTailscaleUnsafe();
+    assertCurrentGeneration(generation);
+    alreadyUp = false;
+  }
+
+  const live = activeNodeConfig
+    ? await getLiveTransportUrlUnsafe(parsed.original)
+    : null;
+  assertCurrentGeneration(generation);
+  if (live && activeForward) {
     return {
       transportUrl: live,
       displayUrl: parsed.original,
       forward: activeForward,
+      rebuilt: false,
     };
   }
 
-  const alreadyUp = await isTermixTailscaleUp();
   if (!alreadyUp) {
-    await configureTermixTailscale({
-      authKey: opts.authKey.trim(),
-      hostname: opts.hostname || "termix-mobile",
-      ephemeral: opts.ephemeral ?? true,
-    });
+    await configureTermixTailscale(desiredConfig);
+    assertCurrentGeneration(generation);
     await upTermixTailscale();
+    assertCurrentGeneration(generation);
+    activeNodeConfig = desiredConfig;
   }
 
-  // Drop only stale forwards, then open the one we need.
   try {
     await stopAllTermixTailscaleForwards();
-  } catch {
-    // best-effort
+  } finally {
+    activeForward = null;
   }
-  activeForward = null;
+  assertCurrentGeneration(generation);
 
-  const forward = await startTermixTailscaleForward(parsed.host, parsed.port);
+  const forward = await startTermixTailscaleForward(
+    parsed.protocol,
+    parsed.host,
+    parsed.port,
+  );
+  if (generation !== lifecycleGeneration) {
+    await stopAllTermixTailscaleForwards().catch(() => undefined);
+    throw new TailscaleTransportError(
+      "stale_operation",
+      "A newer Tailscale transport operation replaced this one.",
+    );
+  }
   activeForward = forward;
 
   return {
     transportUrl: transportUrlFor(forward, parsed.rest),
     displayUrl: parsed.original,
     forward,
+    rebuilt: true,
   };
 }
 
-export async function disconnectTailscaleForwards(): Promise<void> {
-  try {
-    await stopAllTermixTailscaleForwards();
-  } finally {
-    activeForward = null;
-  }
+/** Bring up userspace Tailscale and return the current loopback transport. */
+export function connectServerViaTailscale(
+  opts: ConnectServerViaTailscaleOptions,
+): Promise<TailscaleTransportResult> {
+  const generation = ++lifecycleGeneration;
+  return withTailscaleLifecycleLock(() =>
+    connectServerViaTailscaleUnsafe(opts, generation).catch((error) => {
+      throw asTransportError(error);
+    }),
+  );
 }
 
-export async function shutdownTailscale(): Promise<void> {
-  try {
-    await stopAllTermixTailscaleForwards();
-    await closeTermixTailscale();
-  } finally {
-    activeForward = null;
-  }
+export function disconnectTailscaleForwards(): Promise<void> {
+  const generation = ++lifecycleGeneration;
+  return withTailscaleLifecycleLock(async () => {
+    try {
+      await stopAllTermixTailscaleForwards();
+      assertCurrentGeneration(generation);
+    } finally {
+      activeForward = null;
+    }
+  });
+}
+
+export function shutdownTailscale(): Promise<void> {
+  const generation = ++lifecycleGeneration;
+  return withTailscaleLifecycleLock(async () => {
+    await shutdownTailscaleUnsafe();
+    assertCurrentGeneration(generation);
+  });
 }
 
 /**
- * Ensure a localhost forward exists for displayUrl.
- * Reuses live forwards; otherwise joins with SecureStore auth key.
+ * Validate or rebuild the transport using the credentials stored in SecureStore.
+ * Concurrent callers for the same display URL share one recovery flight.
  */
+export function recoverTailscaleTransport(
+  displayUrl: string,
+): Promise<TailscaleTransportResult> {
+  const parsed = parseServerUrl(displayUrl);
+  if (recoveryFlight?.displayUrl === parsed.original) {
+    return recoveryFlight.promise;
+  }
+
+  const generation = ++lifecycleGeneration;
+  const promise = withTailscaleLifecycleLock(async () => {
+    try {
+      const live = await getLiveTransportUrlUnsafe(parsed.original);
+      assertCurrentGeneration(generation);
+      if (live && activeForward) {
+        return {
+          transportUrl: live,
+          displayUrl: parsed.original,
+          forward: activeForward,
+          rebuilt: false,
+        };
+      }
+
+      const settings = await loadTailscaleSettings();
+      assertCurrentGeneration(generation);
+      if (!settings.authKey.trim()) {
+        throw new TailscaleTransportError(
+          "missing_auth_key",
+          "No saved Tailscale auth key is available.",
+        );
+      }
+
+      // A failed strong health check is not reusable. Close all stale native
+      // state before rebuilding so an old listener cannot survive foregrounding.
+      await shutdownTailscaleUnsafe().catch(() => undefined);
+      assertCurrentGeneration(generation);
+
+      return await connectServerViaTailscaleUnsafe(
+        {
+          serverUrl: parsed.original,
+          authKey: settings.authKey,
+          hostname: settings.hostname,
+          ephemeral: true,
+        },
+        generation,
+      );
+    } catch (error) {
+      throw asTransportError(error);
+    }
+  });
+
+  recoveryFlight = { displayUrl: parsed.original, promise };
+  const clearRecoveryFlight = () => {
+    if (recoveryFlight?.promise === promise) recoveryFlight = null;
+  };
+  void promise.then(clearRecoveryFlight, clearRecoveryFlight);
+  return promise;
+}
+
+/** Compatibility wrapper for callers that only need a nullable URL. */
 export async function rehydrateTailscaleTransport(
   displayUrl: string,
 ): Promise<string | null> {
   if (!isTermixTailscaleAvailable()) return null;
-
-  const live = getLiveTransportUrl(displayUrl);
-  if (live && (await isTermixTailscaleUp())) {
-    return live;
-  }
-
-  const settings = await loadTailscaleSettings();
-  if (!settings.authKey) return null;
-
   try {
-    const { transportUrl } = await connectServerViaTailscale({
-      serverUrl: displayUrl,
-      authKey: settings.authKey,
-      hostname: settings.hostname,
-      ephemeral: true,
-    });
-    return transportUrl;
+    return (await recoverTailscaleTransport(displayUrl)).transportUrl;
   } catch {
     return null;
   }
 }
 
-/** True when user previously saved a Tailscale auth key for this app. */
+/** True when the user previously saved a Tailscale auth key for this app. */
 export async function isTailscaleConfigured(): Promise<boolean> {
   if (!isTermixTailscaleAvailable()) return false;
-  const s = await loadTailscaleSettings();
-  return !!s.authKey.trim();
+  const settings = await loadTailscaleSettings();
+  return !!settings.authKey.trim();
 }

@@ -9,6 +9,7 @@ type Props = {
   visible: boolean;
   busy?: boolean;
   serverLabel?: string;
+  errorMessage?: string | null;
   onChoose: (mode: NetworkModeChoice) => void;
   onDismiss?: () => void;
 };
@@ -21,6 +22,7 @@ export function NetworkModeDialog({
   visible,
   busy,
   serverLabel,
+  errorMessage,
   onChoose,
   onDismiss,
 }: Props) {
@@ -63,6 +65,14 @@ export function NetworkModeDialog({
             local network. You can change this anytime via Change server.
           </Text>
 
+          {errorMessage ? (
+            <View className="mb-4 border border-red-500/50 bg-red-500/10 px-3 py-2.5">
+              <Text className="text-[11px] leading-4 text-red-400">
+                {errorMessage}
+              </Text>
+            </View>
+          ) : null}
+
           {busy ? (
             <View className="items-center py-6">
               <ActivityIndicator color={accent} />
@@ -84,7 +94,9 @@ export function NetworkModeDialog({
                 variant="outline"
                 size="lg"
                 onPress={() => onChoose("tailscale")}
-                icon={<Network size={16} color={color("foreground") ?? "#fff"} />}
+                icon={
+                  <Network size={16} color={color("foreground") ?? "#fff"} />
+                }
               >
                 Via Tailscale
               </Button>

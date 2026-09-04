@@ -66,9 +66,13 @@ export async function setCookie(
   try {
     await AsyncStorage.setItem(name, value);
   } catch (error) {
-    systemLogger.error(`[setCookie] Failed to persist ${name} to AsyncStorage`, error, {
-      operation: "set_cookie",
-    });
+    systemLogger.error(
+      `[setCookie] Failed to persist ${name} to AsyncStorage`,
+      error,
+      {
+        operation: "set_cookie",
+      },
+    );
   }
 }
 
@@ -77,9 +81,13 @@ export async function getCookie(name: string): Promise<string | undefined> {
     const token = await AsyncStorage.getItem(name);
     return token || undefined;
   } catch (error) {
-    systemLogger.error(`[getCookie] Failed to read ${name} from AsyncStorage`, error, {
-      operation: "get_cookie",
-    });
+    systemLogger.error(
+      `[getCookie] Failed to read ${name} from AsyncStorage`,
+      error,
+      {
+        operation: "get_cookie",
+      },
+    );
     return undefined;
   }
 }
@@ -95,13 +103,21 @@ function createApiInstance(
   });
 
   instance.interceptors.request.use(async (config) => {
+    await waitForServerTransportReady();
+    const token = await getCookie("jwt");
+
+    // Reading AsyncStorage yields back to the event loop. iOS can transition to
+    // inactive during that await, so re-check the barrier and capture the latest
+    // transport only after all asynchronous request preparation is complete.
+    await waitForServerTransportReady();
+    config.baseURL = getLatestServiceBaseURL(serviceName, config.baseURL);
+
     const startTime = performance.now();
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     (config as any).startTime = startTime;
     (config as any).requestId = requestId;
-
-    const token = await getCookie("jwt");
+    (config as any).apiConfigGeneration = apiConfigGeneration;
 
     const method = config.method?.toUpperCase() || "UNKNOWN";
     const url = config.url || "UNKNOWN";
@@ -139,6 +155,17 @@ function createApiInstance(
 
   instance.interceptors.response.use(
     (response) => {
+      if (
+        (response.config as any).apiConfigGeneration !== undefined &&
+        (response.config as any).apiConfigGeneration !== apiConfigGeneration
+      ) {
+        return Promise.reject(
+          new Error(
+            "Server transport changed while the request was in flight.",
+          ),
+        );
+      }
+
       const endTime = performance.now();
       const startTime = (response.config as any).startTime;
       const requestId = (response.config as any).requestId;
@@ -175,6 +202,17 @@ function createApiInstance(
       return response;
     },
     (error: AxiosError) => {
+      if (
+        (error.config as any)?.apiConfigGeneration !== undefined &&
+        (error.config as any).apiConfigGeneration !== apiConfigGeneration
+      ) {
+        return Promise.reject(
+          new Error(
+            "Server transport changed while the request was in flight.",
+          ),
+        );
+      }
+
       const endTime = performance.now();
       const startTime = (error.config as any)?.startTime;
       const requestId = (error.config as any)?.requestId;
@@ -265,16 +303,140 @@ export function setAuthStateCallback(
 let configuredServerUrl: string | null = null;
 /** Full last-saved config (includes displayUrl / viaTailscale when set). */
 let configuredServerMeta: ServerConfig | null = null;
+let apiConfigGeneration = 0;
 
-export async function saveServerConfig(config: ServerConfig): Promise<boolean> {
+type TransportBarrierState = {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+} | null;
+
+let foregroundTransportBarrier: TransportBarrierState = null;
+const latestServiceBaseURLs = new Map<string, string>();
+
+function getLatestServiceBaseURL(
+  serviceName: string,
+  fallback?: string,
+): string | undefined {
+  if (serviceName === "DOCKER") {
+    return getRootBase(30007).replace(/\/$/, "");
+  }
+  return latestServiceBaseURLs.get(serviceName) || fallback;
+}
+
+export function blockServerTransportRequests(): void {
+  if (foregroundTransportBarrier) return;
+
+  // Invalidate responses that began on the transport being suspended. They
+  // must not apply stale data or turn an old-port 401 into a logout.
+  apiConfigGeneration += 1;
+
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  // A foreground recovery may finish before another request observes the
+  // barrier. Attach a rejection handler here so that failure never creates an
+  // unhandled promise while still rejecting actual waiters below.
+  void promise.catch(() => undefined);
+  foregroundTransportBarrier = { promise, resolve, reject };
+}
+
+export function releaseServerTransportRequests(): void {
+  const barrier = foregroundTransportBarrier;
+  foregroundTransportBarrier = null;
+  barrier?.resolve();
+}
+
+export function failServerTransportRequests(error: unknown): void {
+  const barrier = foregroundTransportBarrier;
+  foregroundTransportBarrier = null;
+  const reason =
+    error instanceof Error
+      ? error
+      : new Error("The selected server transport is unavailable.");
+  barrier?.reject(reason);
+}
+
+export async function waitForServerTransportReady(): Promise<void> {
+  // A resolved barrier can be replaced before this continuation runs (for
+  // example active -> inactive while a request is reading its JWT). Only return
+  // when there is no newer barrier to wait on.
+  while (foregroundTransportBarrier) {
+    const barrier = foregroundTransportBarrier;
+    await barrier.promise;
+  }
+}
+
+export type SaveServerConfigOptions = {
+  /** Skip route detection after committing the new runtime transport. */
+  detect?: boolean;
+  /**
+   * Runtime-only URL to publish atomically with the persisted display metadata.
+   * Used by Tailscale so no request can observe the remote origin in between.
+   */
+  runtimeUrl?: string;
+};
+
+export async function saveServerConfig(
+  config: ServerConfig,
+  options: SaveServerConfigOptions = {},
+): Promise<boolean> {
   try {
-    await AsyncStorage.setItem("serverConfig", JSON.stringify(config));
-    configuredServerUrl = config.serverUrl;
-    configuredServerMeta = config;
+    const normalizedServerUrl = normalizeServerUrl(config.serverUrl);
+    const normalizedDisplayUrl = config.displayUrl
+      ? normalizeServerUrl(config.displayUrl)
+      : undefined;
+    const normalizedConfig: ServerConfig = {
+      ...config,
+      serverUrl: normalizedServerUrl,
+      ...(normalizedDisplayUrl ? { displayUrl: normalizedDisplayUrl } : {}),
+    };
+
+    const runtimeUrl = options.runtimeUrl
+      ? normalizeServerUrl(options.runtimeUrl)
+      : normalizedConfig.serverUrl;
+
+    await AsyncStorage.setItem(
+      "serverConfig",
+      JSON.stringify(normalizedConfig),
+    );
+    configuredServerMeta = normalizedConfig;
+    configuredServerUrl = runtimeUrl;
     updateApiInstances();
-    await detectAndUpdateApiInstances();
+    if (options.detect !== false) {
+      await detectAndUpdateApiInstances();
+    }
     return true;
   } catch (error) {
+    return false;
+  }
+}
+
+function normalizeServerUrl(url: string): string {
+  const input = url.trim();
+  if (!input) throw new Error("Invalid server URL");
+  const parsed = new URL(input);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Server URL must use HTTP or HTTPS");
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(
+      "Server URL must not include query parameters or a fragment.",
+    );
+  }
+  const pathname =
+    parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.origin}${pathname}`;
+}
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
     return false;
   }
 }
@@ -313,101 +475,48 @@ export async function initializeServerConfig(
       const config = JSON.parse(configStr) as ServerConfig;
 
       if (config?.serverUrl || config?.displayUrl) {
-        const displayUrl = config.displayUrl || config.serverUrl;
-        configuredServerMeta = { ...config, displayUrl };
-        configuredServerUrl = config.serverUrl || displayUrl;
+        const displayUrl = normalizeServerUrl(
+          config.displayUrl || config.serverUrl,
+        );
+        const currentRuntimeUrl = configuredServerUrl;
+        const preserveRuntimeTransport =
+          config.viaTailscale === true &&
+          !!currentRuntimeUrl &&
+          isLoopbackUrl(currentRuntimeUrl);
 
-        // Prefer a live Tailscale forward over stale localhost ports from disk.
-        if (displayUrl) {
+        configuredServerMeta = {
+          ...config,
+          serverUrl: displayUrl,
+          displayUrl,
+        };
+        configuredServerUrl = preserveRuntimeTransport
+          ? currentRuntimeUrl
+          : displayUrl;
+
+        if (config.viaTailscale) {
           try {
-            const {
-              getLiveTransportUrl,
-              rehydrateTailscaleTransport,
-              isTailscaleConfigured,
-            } = await import("./utils/tailscaleConnect");
-
-            const live = getLiveTransportUrl(displayUrl);
+            const { getLiveTransportUrl, recoverTailscaleTransport } =
+              await import("./utils/tailscaleConnect");
+            const live = await getLiveTransportUrl(displayUrl);
             if (live) {
               configuredServerUrl = live;
-              configuredServerMeta = {
-                ...configuredServerMeta,
-                serverUrl: live,
-                displayUrl,
-                viaTailscale: true,
-              };
-            } else if (
-              rehydrateTailscale &&
-              (config.viaTailscale || (await isTailscaleConfigured()))
-            ) {
-              // Only auto-rejoin when the last session used TS, or when the
-              // caller explicitly wants rehydrate (boot path handles chooser).
-              if (config.viaTailscale) {
-                const transportUrl =
-                  await rehydrateTailscaleTransport(displayUrl);
-                if (transportUrl) {
-                  configuredServerUrl = transportUrl;
-                  configuredServerMeta = {
-                    ...configuredServerMeta,
-                    serverUrl: transportUrl,
-                    displayUrl,
-                    viaTailscale: true,
-                    lastUpdated: new Date().toISOString(),
-                  };
-                  // Persist transport only for crash recovery hints; displayUrl stays.
-                  await AsyncStorage.setItem(
-                    "serverConfig",
-                    JSON.stringify({
-                      ...configuredServerMeta,
-                      // Store display as serverUrl fallback so cold start without
-                      // rehydrate still has a usable absolute URL.
-                      serverUrl: displayUrl,
-                      displayUrl,
-                      viaTailscale: true,
-                    }),
-                  );
-                } else {
-                  // Keep memory pointing at display URL for direct attempt; do not
-                  // wipe viaTailscale capability from disk permanently here.
-                  configuredServerUrl = displayUrl;
-                  configuredServerMeta = {
-                    ...configuredServerMeta,
-                    serverUrl: displayUrl,
-                    displayUrl,
-                    viaTailscale: false,
-                  };
-                }
-              }
-            } else if (
-              configuredServerUrl?.includes("127.0.0.1") &&
-              displayUrl &&
-              !live
-            ) {
-              // Stale localhost from a previous process — fall back to display.
-              configuredServerUrl = displayUrl;
-              configuredServerMeta = {
-                ...configuredServerMeta,
-                serverUrl: displayUrl,
-                displayUrl,
-                viaTailscale: false,
-              };
+            } else if (rehydrateTailscale) {
+              configuredServerUrl = (
+                await recoverTailscaleTransport(displayUrl)
+              ).transportUrl;
             }
-          } catch (e) {
+          } catch (error) {
+            // Preserve the selected mode and display origin. The startup chooser
+            // or foreground recovery owns retry/fallback decisions; initialization
+            // must never silently reinterpret a Tailscale server as Direct/LAN.
+            configuredServerUrl = displayUrl;
             systemLogger.warn(
-              "[initializeServerConfig] Tailscale rehydrate failed",
+              "[initializeServerConfig] Tailscale transport unavailable",
               {
                 operation: "initialize_server_config",
-                error: e instanceof Error ? e.message : String(e),
+                error: error instanceof Error ? error.message : String(error),
               },
             );
-            if (displayUrl) {
-              configuredServerUrl = displayUrl;
-              configuredServerMeta = {
-                ...configuredServerMeta!,
-                serverUrl: displayUrl,
-                displayUrl,
-                viaTailscale: false,
-              };
-            }
           }
         }
 
@@ -418,9 +527,13 @@ export async function initializeServerConfig(
       }
     }
   } catch (error) {
-    systemLogger.error("[initializeServerConfig] Failed to load server config", error, {
-      operation: "initialize_server_config",
-    });
+    systemLogger.error(
+      "[initializeServerConfig] Failed to load server config",
+      error,
+      {
+        operation: "initialize_server_config",
+      },
+    );
   }
 }
 
@@ -428,29 +541,37 @@ export async function initializeServerConfig(
  * Apply transport for the session: direct display URL, or Tailscale forward.
  * Persists displayUrl + viaTailscale preference without requiring re-entry.
  */
+export type ApplyServerTransportResult =
+  | { ok: true; runtimeUrl: string }
+  | { ok: false; error: string };
+
 export async function applyServerTransportMode(
   mode: "direct" | "tailscale",
-): Promise<boolean> {
+): Promise<ApplyServerTransportResult> {
   const displayUrl =
     configuredServerMeta?.displayUrl ||
     configuredServerMeta?.serverUrl ||
     configuredServerUrl;
-  // Need a real remote origin; refuse to treat localhost as display URL.
-  const origin =
-    (configuredServerMeta?.displayUrl || displayUrl || "").trim() || null;
-  if (!origin || origin.includes("127.0.0.1")) {
-    return false;
+  let origin: string;
+  try {
+    origin = normalizeServerUrl(displayUrl || "");
+  } catch {
+    return { ok: false, error: "The configured server address is invalid." };
+  }
+  if (isLoopbackUrl(origin)) {
+    return {
+      ok: false,
+      error: "The saved server address points to an expired local transport.",
+    };
   }
 
   try {
     if (mode === "direct") {
-      const { disconnectTailscaleForwards } = await import(
-        "./utils/tailscaleConnect"
-      );
+      const { shutdownTailscale } = await import("./utils/tailscaleConnect");
       try {
-        await disconnectTailscaleForwards();
+        await shutdownTailscale();
       } catch {
-        // optional
+        // A stale native node must not prevent an explicit Direct/LAN choice.
       }
       configuredServerUrl = origin;
       configuredServerMeta = {
@@ -465,19 +586,14 @@ export async function applyServerTransportMode(
       );
       updateApiInstances();
       await detectAndUpdateApiInstances();
-      return true;
+      return { ok: true, runtimeUrl: origin };
     }
 
-    const { rehydrateTailscaleTransport, loadTailscaleSettings } = await import(
-      "./utils/tailscaleConnect"
-    );
-    const settings = await loadTailscaleSettings();
-    if (!settings.authKey) return false;
+    const { recoverTailscaleTransport } =
+      await import("./utils/tailscaleConnect");
+    const recovered = await recoverTailscaleTransport(origin);
 
-    const transportUrl = await rehydrateTailscaleTransport(origin);
-    if (!transportUrl) return false;
-
-    // Disk keeps the real origin; memory uses localhost transport.
+    // Disk keeps the real origin and selected mode; memory uses localhost.
     configuredServerMeta = {
       serverUrl: origin,
       displayUrl: origin,
@@ -488,16 +604,20 @@ export async function applyServerTransportMode(
       "serverConfig",
       JSON.stringify(configuredServerMeta),
     );
-    configuredServerUrl = transportUrl;
+    configuredServerUrl = normalizeServerUrl(recovered.transportUrl);
     updateApiInstances();
     await detectAndUpdateApiInstances();
-    return true;
-  } catch (e) {
+    return { ok: true, runtimeUrl: configuredServerUrl };
+  } catch (error) {
+    const message =
+      error instanceof Error && error.message.trim()
+        ? error.message
+        : "Unable to establish the Tailscale transport.";
     systemLogger.warn("[applyServerTransportMode] failed", {
       operation: "apply_server_transport_mode",
-      error: e instanceof Error ? e.message : String(e),
+      error: message,
     });
-    return false;
+    return { ok: false, error: message };
   }
 }
 
@@ -522,11 +642,22 @@ export function getServerConfigMeta(): ServerConfig | null {
  * Point axios/WS at a transport URL without rewriting the persisted display URL.
  * Used after Tailscale local-forward setup (http://127.0.0.1:port).
  */
+export type SetRuntimeTransportOptions = {
+  detect?: boolean;
+};
+
 export async function setRuntimeTransportUrl(
   transportUrl: string,
+  options: SetRuntimeTransportOptions = {},
 ): Promise<void> {
-  configuredServerUrl = transportUrl.replace(/\/$/, "");
+  configuredServerUrl = normalizeServerUrl(transportUrl);
   updateApiInstances();
+  if (options.detect !== false) {
+    await detectAndUpdateApiInstances();
+  }
+}
+
+export async function detectServerRoutes(): Promise<void> {
   await detectAndUpdateApiInstances();
 }
 
@@ -577,9 +708,13 @@ export async function clearAuth(): Promise<void> {
   try {
     await AsyncStorage.removeItem("jwt");
   } catch (error) {
-    systemLogger.error("[clearAuth] Failed to remove jwt from AsyncStorage", error, {
-      operation: "clear_auth",
-    });
+    systemLogger.error(
+      "[clearAuth] Failed to remove jwt from AsyncStorage",
+      error,
+      {
+        operation: "clear_auth",
+      },
+    );
   }
 }
 
@@ -589,6 +724,8 @@ export async function clearServerConfig(): Promise<void> {
     await AsyncStorage.removeItem("server");
     configuredServerUrl = null;
     configuredServerMeta = null;
+    releaseServerTransportRequests();
+    updateApiInstances();
     try {
       const { shutdownTailscale } = await import("./utils/tailscaleConnect");
       await shutdownTailscale();
@@ -684,99 +821,83 @@ function getHostBase(defaultPort: number): string {
 }
 
 function initializeApiInstances() {
-  sshHostApi = createApiInstance(getHostBase(8081), "SSH_HOST");
+  const sshHostBase = getHostBase(8081);
+  const tunnelBase = getApiUrl("/ssh", 8083);
+  const fileManagerBase = getApiUrl("/ssh/file_manager", 8084);
+  const statsBase = getApiUrl("", 8085);
+  const authBase = getRootBase(8081);
 
-  tunnelApi = createApiInstance(getApiUrl("/ssh", 8083), "TUNNEL");
+  latestServiceBaseURLs.set("SSH_HOST", sshHostBase);
+  latestServiceBaseURLs.set("TUNNEL", tunnelBase);
+  latestServiceBaseURLs.set("FILE_MANAGER", fileManagerBase);
+  latestServiceBaseURLs.set("STATS", statsBase);
+  latestServiceBaseURLs.set("AUTH", authBase);
 
-  fileManagerApi = createApiInstance(
-    getApiUrl("/ssh/file_manager", 8084),
-    "FILE_MANAGER",
-  );
-
-  statsApi = createApiInstance(getApiUrl("", 8085), "STATS");
-
-  authApi = createApiInstance(getRootBase(8081), "AUTH");
+  sshHostApi = createApiInstance(sshHostBase, "SSH_HOST");
+  tunnelApi = createApiInstance(tunnelBase, "TUNNEL");
+  fileManagerApi = createApiInstance(fileManagerBase, "FILE_MANAGER");
+  statsApi = createApiInstance(statsBase, "STATS");
+  authApi = createApiInstance(authBase, "AUTH");
 }
 
 async function detectAndUpdateApiInstances(): Promise<void> {
+  const detectionGeneration = apiConfigGeneration;
+  const detectionTransportUrl = configuredServerUrl;
+  const statsRootBase = getRootBase(8085).replace(/\/$/, "");
+  const statsSshBase = getSshBase(8085).replace(/\/$/, "");
+  const authRootBase = getRootBase(8081).replace(/\/$/, "");
+  const authSshBase = getSshBase(8081).replace(/\/$/, "");
+
   try {
     const token = await getCookie("jwt");
     const authHeaders = {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
+    const probe = async (baseURL: string, path: string) => {
+      try {
+        await axios
+          .create({ baseURL, timeout: 5000, headers: authHeaders })
+          .head(path);
+        return true;
+      } catch {
+        return false;
+      }
+    };
 
     const [statsRootOk, statsSshOk, authRootOk, authSshOk] = await Promise.all([
-      (async () => {
-        try {
-          const base = getRootBase(8085).replace(/\/$/, "");
-          const testInstance = axios.create({
-            baseURL: base,
-            timeout: 5000,
-            headers: authHeaders,
-          });
-          await testInstance.head("/status");
-          return true;
-        } catch {
-          return false;
-        }
-      })(),
-      (async () => {
-        try {
-          const base = getSshBase(8085).replace(/\/$/, "");
-          const testInstance = axios.create({
-            baseURL: base,
-            timeout: 5000,
-            headers: authHeaders,
-          });
-          await testInstance.head("/status");
-          return true;
-        } catch {
-          return false;
-        }
-      })(),
-      (async () => {
-        try {
-          const base = getRootBase(8081).replace(/\/$/, "");
-          const testInstance = axios.create({
-            baseURL: base,
-            timeout: 5000,
-            headers: authHeaders,
-          });
-          await testInstance.head("/users/registration-allowed");
-          return true;
-        } catch {
-          return false;
-        }
-      })(),
-      (async () => {
-        try {
-          const base = getSshBase(8081).replace(/\/$/, "");
-          const testInstance = axios.create({
-            baseURL: base,
-            timeout: 5000,
-            headers: authHeaders,
-          });
-          await testInstance.head("/users/registration-allowed");
-          return true;
-        } catch {
-          return false;
-        }
-      })(),
+      probe(statsRootBase, "/status"),
+      probe(statsSshBase, "/status"),
+      probe(authRootBase, "/users/registration-allowed"),
+      probe(authSshBase, "/users/registration-allowed"),
     ]);
 
+    if (
+      detectionGeneration !== apiConfigGeneration ||
+      detectionTransportUrl !== configuredServerUrl
+    ) {
+      return;
+    }
+
     if (statsRootOk) {
-      statsApi = createApiInstance(getRootBase(8085), "STATS");
+      latestServiceBaseURLs.set("STATS", statsRootBase);
+      statsApi = createApiInstance(statsRootBase, "STATS");
     } else if (statsSshOk) {
-      statsApi = createApiInstance(getSshBase(8085), "STATS");
+      latestServiceBaseURLs.set("STATS", statsSshBase);
+      statsApi = createApiInstance(statsSshBase, "STATS");
     }
 
     if (authRootOk) {
-      authApi = createApiInstance(getRootBase(8081), "AUTH");
+      latestServiceBaseURLs.set("AUTH", authRootBase);
+      authApi = createApiInstance(authRootBase, "AUTH");
     } else if (authSshOk) {
-      authApi = createApiInstance(getSshBase(8081), "AUTH");
+      latestServiceBaseURLs.set("AUTH", authSshBase);
+      authApi = createApiInstance(authSshBase, "AUTH");
     }
-  } catch (e) {}
+  } catch {
+    // Route detection is advisory. The default clients already target the
+    // committed transport and remain valid when probes are unavailable.
+  }
 }
 
 export let sshHostApi: AxiosInstance;
@@ -792,6 +913,7 @@ export let authApi: AxiosInstance;
 initializeApiInstances();
 
 function updateApiInstances() {
+  apiConfigGeneration += 1;
   systemLogger.info("Updating API instances with new server configuration", {
     operation: "api_instance_update",
     configuredServerUrl,
@@ -853,10 +975,9 @@ export function isUnauthorizedError(error: unknown): boolean {
 export function extractConnectionLogs(
   source: unknown,
 ): { type: string; stage?: string; message: string }[] {
-  const data =
-    axios.isAxiosError(source)
-      ? (source.response?.data as any)
-      : (source as any);
+  const data = axios.isAxiosError(source)
+    ? (source.response?.data as any)
+    : (source as any);
   const logs = data?.connectionLogs;
   return Array.isArray(logs) ? logs : [];
 }
@@ -2311,8 +2432,12 @@ function normalizeMetrics(raw: any): ServerMetrics {
   const rawLogin = raw.login_stats ?? raw.loginStats;
   const loginStats: LoginStatsMetrics | undefined = rawLogin
     ? {
-        recentLogins: Array.isArray(rawLogin.recentLogins) ? rawLogin.recentLogins : [],
-        failedLogins: Array.isArray(rawLogin.failedLogins) ? rawLogin.failedLogins : [],
+        recentLogins: Array.isArray(rawLogin.recentLogins)
+          ? rawLogin.recentLogins
+          : [],
+        failedLogins: Array.isArray(rawLogin.failedLogins)
+          ? rawLogin.failedLogins
+          : [],
         totalLogins: rawLogin.totalLogins ?? 0,
         uniqueIPs: rawLogin.uniqueIPs ?? 0,
       }
@@ -2321,7 +2446,9 @@ function normalizeMetrics(raw: any): ServerMetrics {
   return { ...raw, processes, network, loginStats } as ServerMetrics;
 }
 
-export async function getServerMetricsById(id: number): Promise<ServerMetrics | null> {
+export async function getServerMetricsById(
+  id: number,
+): Promise<ServerMetrics | null> {
   try {
     const response = await statsApi.get(`/metrics/${id}`);
     return response.data ? normalizeMetrics(response.data) : null;
@@ -2352,9 +2479,15 @@ export async function startMetricsPolling(id: number): Promise<{
   }
 }
 
-export async function stopMetricsPolling(id: number, viewerSessionId?: string): Promise<void> {
+export async function stopMetricsPolling(
+  id: number,
+  viewerSessionId?: string,
+): Promise<void> {
   try {
-    await statsApi.post(`/metrics/stop/${id}`, viewerSessionId ? { viewerSessionId } : undefined);
+    await statsApi.post(
+      `/metrics/stop/${id}`,
+      viewerSessionId ? { viewerSessionId } : undefined,
+    );
   } catch {
     // Best-effort on teardown.
   }
@@ -2382,7 +2515,9 @@ export async function registerMetricsViewer(id: number): Promise<{
   skipped?: boolean;
 }> {
   try {
-    const response = await statsApi.post("/metrics/register-viewer", { hostId: id });
+    const response = await statsApi.post("/metrics/register-viewer", {
+      hostId: id,
+    });
     return response.data || {};
   } catch {
     // Best-effort.
@@ -2390,16 +2525,24 @@ export async function registerMetricsViewer(id: number): Promise<{
   }
 }
 
-export async function unregisterMetricsViewer(id: number, viewerSessionId: string): Promise<void> {
+export async function unregisterMetricsViewer(
+  id: number,
+  viewerSessionId: string,
+): Promise<void> {
   try {
-    await statsApi.post("/metrics/unregister-viewer", { hostId: id, viewerSessionId });
+    await statsApi.post("/metrics/unregister-viewer", {
+      hostId: id,
+      viewerSessionId,
+    });
   } catch {
     // Best-effort on teardown.
   }
 }
 
 /** Heartbeat so the backend knows a viewer is still watching this host. */
-export async function sendMetricsHeartbeat(viewerSessionId: string): Promise<void> {
+export async function sendMetricsHeartbeat(
+  viewerSessionId: string,
+): Promise<void> {
   try {
     await statsApi.post("/metrics/heartbeat", { viewerSessionId });
   } catch {
@@ -2411,7 +2554,9 @@ export async function refreshServerPolling(): Promise<void> {
   try {
     await statsApi.post("/refresh");
   } catch (error) {
-    statsLogger.warn("Failed to refresh server polling", { operation: "refresh_polling" });
+    statsLogger.warn("Failed to refresh server polling", {
+      operation: "refresh_polling",
+    });
   }
 }
 
@@ -2421,7 +2566,9 @@ export async function notifyHostCreatedOrUpdated(
   try {
     await statsApi.post("/host-updated", { hostId });
   } catch (error) {
-    statsLogger.warn("Failed to notify stats server of host update", { operation: "notify_host_updated" });
+    statsLogger.warn("Failed to notify stats server of host update", {
+      operation: "notify_host_updated",
+    });
   }
 }
 
@@ -3973,10 +4120,7 @@ export async function getActiveSessions(): Promise<ActiveSessionInfo[]> {
 // earlier in this file.
 // ============================================================================
 
-export type {
-  DockerContainer,
-  DockerContainerStats,
-} from "../types/index";
+export type { DockerContainer, DockerContainerStats } from "../types/index";
 
 /**
  * Docker REST API base. nginx routes /docker/* → port 30007 from the server
@@ -4072,10 +4216,9 @@ export async function getDockerContainers(
   all = true,
 ): Promise<DockerContainer[]> {
   try {
-    const response = await dockerApi().get(
-      `/docker/containers/${sessionId}`,
-      { params: { all } },
-    );
+    const response = await dockerApi().get(`/docker/containers/${sessionId}`, {
+      params: { all },
+    });
     const data = response.data;
     return Array.isArray(data) ? data : (data?.containers ?? []);
   } catch (error) {
@@ -4153,7 +4296,9 @@ export async function getDockerContainerLogs(
 // WAKE-ON-LAN
 // ============================================================================
 
-export async function wakeHost(hostId: number): Promise<{ success: boolean; message: string }> {
+export async function wakeHost(
+  hostId: number,
+): Promise<{ success: boolean; message: string }> {
   try {
     const response = await sshHostApi.post(`/db/host/${hostId}/wake`);
     return response.data;
@@ -4212,7 +4357,9 @@ export async function deleteApiKey(keyId: string): Promise<void> {
 // TOTP BACKUP CODES
 // ============================================================================
 
-export async function getTOTPBackupCodes(): Promise<{ backup_codes: string[] }> {
+export async function getTOTPBackupCodes(): Promise<{
+  backup_codes: string[];
+}> {
   try {
     const response = await authApi.get("/users/totp/backup-codes");
     return response.data;

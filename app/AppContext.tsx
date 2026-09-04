@@ -10,20 +10,28 @@ import React, {
 import { AppState, AppStateStatus } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
-  getVersionInfo,
-  initializeServerConfig,
   applyServerTransportMode,
-  getLatestGitHubRelease,
-  setAuthStateCallback,
+  blockServerTransportRequests,
+  clearAuth,
+  detectServerRoutes,
+  failServerTransportRequests,
   getCurrentServerUrl,
   getDisplayServerUrl,
+  getLatestGitHubRelease,
+  getServerConfigMeta,
   getUserInfo,
-  clearAuth,
+  getVersionInfo,
+  initializeServerConfig,
   isUnauthorizedError,
+  releaseServerTransportRequests,
+  setAuthStateCallback,
+  setRuntimeTransportUrl,
 } from "./main-axios";
 import {
-  isTailscaleConfigured,
   getLiveTransportUrl,
+  getTailscaleTransportErrorMessage,
+  isTailscaleConfigured,
+  recoverTailscaleTransport,
 } from "./utils/tailscaleConnect";
 import {
   NetworkModeDialog,
@@ -39,6 +47,7 @@ interface Server {
 
 /** Steps the auth flow can be opened directly to. */
 export type AuthStep = "server" | "login" | "signup";
+export type TransportState = "recovering" | "ready" | "failed";
 
 interface AppContextType {
   selectedServer: Server | null;
@@ -53,6 +62,10 @@ interface AppContextType {
   /** Whether a server URL is currently configured (drives empty states). */
   hasServerConfigured: boolean;
   setHasServerConfigured: (has: boolean) => void;
+
+  /** Shared transport must be ready before API calls and terminal foregrounding. */
+  transportState: TransportState;
+  transportReadyEpoch: number;
 
   /** Auth flow overlay control. */
   authFlowVisible: boolean;
@@ -81,6 +94,9 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [showUpdateScreen, setShowUpdateScreen] = useState<boolean>(false);
   const [hasServerConfigured, setHasServerConfigured] = useState(false);
+  const [transportState, setTransportState] =
+    useState<TransportState>("recovering");
+  const [transportReadyEpoch, setTransportReadyEpoch] = useState(0);
 
   const [authFlowVisible, setAuthFlowVisible] = useState(false);
   const [authFlowInitialStep, setAuthFlowInitialStep] =
@@ -88,9 +104,19 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const [networkModeVisible, setNetworkModeVisible] = useState(false);
   const [networkModeBusy, setNetworkModeBusy] = useState(false);
   const [networkModeServerLabel, setNetworkModeServerLabel] = useState("");
+  const [networkModeError, setNetworkModeError] = useState<string | null>(null);
   const networkModeResolverRef = useRef<
-    ((choice: NetworkModeChoice | null) => void) | null
+    ((choice: NetworkModeChoice) => void) | null
   >(null);
+  const networkModePromiseRef = useRef<Promise<NetworkModeChoice> | null>(null);
+  const networkModeOperationRef = useRef<Promise<void> | null>(null);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const transportOperationGenerationRef = useRef(0);
+  const foregroundRecoveryRef = useRef<Promise<void> | null>(null);
+  const initializationStartedRef = useRef(false);
+  const initialConfigurationReadyRef = useRef<Promise<void> | null>(null);
+  const lastValidationTimeRef = useRef(0);
+  const validationInProgressRef = useRef(false);
 
   const openAuthFlow = useCallback((step: AuthStep = "server") => {
     setAuthFlowInitialStep(step);
@@ -101,89 +127,293 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     setAuthFlowVisible(false);
   }, []);
 
+  const markTransportReady = useCallback(() => {
+    setTransportState("ready");
+    setNetworkModeError(null);
+    setTransportReadyEpoch((epoch) => epoch + 1);
+    releaseServerTransportRequests();
+  }, []);
+
+  const markTransportFailed = useCallback((error: unknown) => {
+    const message = getTailscaleTransportErrorMessage(error);
+    // Reject requests that were waiting on the failed recovery, then immediately
+    // install a new barrier so later work cannot leak to the stale port while the
+    // retry/Direct chooser is open.
+    failServerTransportRequests(
+      error instanceof Error ? error : new Error(message),
+    );
+    blockServerTransportRequests();
+    setTransportState("failed");
+    setNetworkModeError(message);
+    return message;
+  }, []);
+
   const promptNetworkMode = useCallback(
-    (serverLabel: string): Promise<NetworkModeChoice | null> => {
+    (
+      serverLabel: string,
+      initialError?: string | null,
+    ): Promise<NetworkModeChoice> => {
       setNetworkModeServerLabel(serverLabel);
       setNetworkModeBusy(false);
+      setNetworkModeError(initialError || null);
       setNetworkModeVisible(true);
-      return new Promise((resolve) => {
+
+      if (networkModePromiseRef.current) {
+        return networkModePromiseRef.current;
+      }
+
+      const promise = new Promise<NetworkModeChoice>((resolve) => {
         networkModeResolverRef.current = resolve;
       });
+      networkModePromiseRef.current = promise;
+      return promise;
     },
     [],
   );
 
+  const resolveNetworkModePrompt = useCallback((choice: NetworkModeChoice) => {
+    const resolve = networkModeResolverRef.current;
+    networkModeResolverRef.current = null;
+    networkModePromiseRef.current = null;
+    setNetworkModeBusy(false);
+    setNetworkModeVisible(false);
+    resolve?.(choice);
+  }, []);
+
   const handleNetworkModeChoice = useCallback(
-    async (choice: NetworkModeChoice) => {
+    (choice: NetworkModeChoice) => {
+      if (networkModeOperationRef.current) return;
+
+      const generation = transportOperationGenerationRef.current;
       setNetworkModeBusy(true);
-      try {
-        const ok = await applyServerTransportMode(choice);
-        if (!ok && choice === "tailscale") {
-          // Fall back to direct so the user can still try LAN.
-          await applyServerTransportMode("direct");
+      setNetworkModeError(null);
+
+      const operation = (async () => {
+        try {
+          const result = await applyServerTransportMode(choice);
+          const isCurrent =
+            generation === transportOperationGenerationRef.current &&
+            appStateRef.current === "active";
+
+          if (!result.ok) {
+            if (isCurrent) {
+              markTransportFailed(new Error(result.error));
+            }
+            setNetworkModeBusy(false);
+            return;
+          }
+
+          // A selection that finishes after backgrounding may persist its choice,
+          // but it must not release the newer background barrier. Foreground
+          // recovery waits for this operation and validates the final choice.
+          if (isCurrent) {
+            markTransportReady();
+          }
+          resolveNetworkModePrompt(choice);
+        } catch (error) {
+          const isCurrent =
+            generation === transportOperationGenerationRef.current &&
+            appStateRef.current === "active";
+          if (isCurrent) {
+            markTransportFailed(error);
+          }
+          setNetworkModeBusy(false);
         }
-        networkModeResolverRef.current?.(choice);
-      } finally {
-        networkModeResolverRef.current = null;
-        setNetworkModeBusy(false);
-        setNetworkModeVisible(false);
-      }
+      })();
+
+      networkModeOperationRef.current = operation;
+      const clearOperation = () => {
+        if (networkModeOperationRef.current === operation) {
+          networkModeOperationRef.current = null;
+        }
+      };
+      void operation.then(clearOperation, clearOperation);
     },
-    [],
+    [markTransportFailed, markTransportReady, resolveNetworkModePrompt],
   );
 
   const handleNetworkModeDismiss = useCallback(() => {
-    // Dismiss = prefer direct for this session.
+    // The close button is an explicit Direct/LAN choice; failures stay visible.
     void handleNetworkModeChoice("direct");
   }, [handleNetworkModeChoice]);
 
-  const checkShouldShowUpdateScreen = async (): Promise<boolean> => {
-    try {
-      const currentAppVersion = Constants.expoConfig?.version || "1.0.0";
-
-      const latestRelease = await getLatestGitHubRelease();
-
-      if (!latestRelease) {
-        return false;
-      }
-
-      if (currentAppVersion === latestRelease.version) {
-        return false;
-      }
-
-      const dismissedVersion = await AsyncStorage.getItem(
-        "dismissedUpdateVersion",
-      );
-
-      if (dismissedVersion === latestRelease.version) {
-        return false;
-      }
-
-      return true;
-    } catch (error) {
-      return false;
-    }
-  };
-
-  useEffect(() => {
-    const initializeApp = async () => {
+  const checkShouldShowUpdateScreen =
+    useCallback(async (): Promise<boolean> => {
       try {
-        setIsLoading(true);
+        const currentAppVersion = Constants.expoConfig?.version || "1.0.0";
+        const latestRelease = await getLatestGitHubRelease();
+        if (!latestRelease || currentAppVersion === latestRelease.version) {
+          return false;
+        }
 
-        // Load config WITHOUT network probes (stored LAN URL is unreachable on
-        // cellular) and WITHOUT auto-joining Tailscale — we prompt first.
-        await initializeServerConfig({
-          rehydrateTailscale: false,
+        const dismissedVersion = await AsyncStorage.getItem(
+          "dismissedUpdateVersion",
+        );
+        return dismissedVersion !== latestRelease.version;
+      } catch {
+        return false;
+      }
+    }, []);
+
+  const validatePersistedSession = useCallback(async () => {
+    if (validationInProgressRef.current) return;
+
+    const now = Date.now();
+    if (now - lastValidationTimeRef.current < 2000) return;
+
+    validationInProgressRef.current = true;
+    lastValidationTimeRef.current = now;
+    try {
+      const userInfo = await getUserInfo();
+      if (!userInfo?.username || userInfo.data_unlocked === false) {
+        setAuthenticated(false);
+      }
+    } catch {
+      // Network failures do not clear a valid persisted login. The centralized
+      // API 401 callback remains authoritative for expired credentials.
+    } finally {
+      validationInProgressRef.current = false;
+    }
+  }, []);
+
+  const recoverSelectedTransport = useCallback(
+    async (generation: number) => {
+      const config = getServerConfigMeta();
+      const displayUrl = getDisplayServerUrl();
+
+      if (config?.viaTailscale) {
+        if (!displayUrl) {
+          throw new Error("No Tailscale server address is configured.");
+        }
+        const recovered = await recoverTailscaleTransport(displayUrl);
+        if (generation !== transportOperationGenerationRef.current)
+          return false;
+
+        await setRuntimeTransportUrl(recovered.transportUrl, {
           detect: false,
         });
+        if (generation !== transportOperationGenerationRef.current)
+          return false;
+
+        await detectServerRoutes();
+        if (generation !== transportOperationGenerationRef.current)
+          return false;
+      }
+
+      if (
+        generation !== transportOperationGenerationRef.current ||
+        appStateRef.current !== "active"
+      ) {
+        return false;
+      }
+      markTransportReady();
+      resolveNetworkModePrompt(config?.viaTailscale ? "tailscale" : "direct");
+      return true;
+    },
+    [markTransportReady, resolveNetworkModePrompt],
+  );
+
+  const runForegroundRecovery = useCallback((): Promise<void> => {
+    if (foregroundRecoveryRef.current) {
+      return foregroundRecoveryRef.current;
+    }
+
+    const generation = ++transportOperationGenerationRef.current;
+    blockServerTransportRequests();
+    setTransportState("recovering");
+
+    const recovery = (async () => {
+      const initialConfigurationReady = initialConfigurationReadyRef.current;
+      if (initialConfigurationReady) {
+        await initialConfigurationReady;
+      }
+
+      const pendingModeOperation = networkModeOperationRef.current;
+      if (pendingModeOperation) {
+        await pendingModeOperation;
+      }
+      if (
+        generation !== transportOperationGenerationRef.current ||
+        appStateRef.current !== "active"
+      ) {
+        return;
+      }
+
+      try {
+        const ready = await recoverSelectedTransport(generation);
+        if (!ready || generation !== transportOperationGenerationRef.current) {
+          return;
+        }
+      } catch (error) {
+        if (generation !== transportOperationGenerationRef.current) return;
+        const displayUrl = getDisplayServerUrl();
+        const message = markTransportFailed(error);
+        if (!displayUrl) return;
+        await promptNetworkMode(displayUrl, message);
+      }
+
+      if (
+        generation === transportOperationGenerationRef.current &&
+        appStateRef.current === "active"
+      ) {
+        setIsLoading(false);
+        if (isAuthenticated) {
+          await validatePersistedSession();
+        }
+      }
+    })();
+
+    foregroundRecoveryRef.current = recovery;
+    const clearRecovery = () => {
+      if (foregroundRecoveryRef.current === recovery) {
+        foregroundRecoveryRef.current = null;
+      }
+    };
+    void recovery.then(clearRecovery, clearRecovery);
+    return recovery;
+  }, [
+    isAuthenticated,
+    markTransportFailed,
+    promptNetworkMode,
+    recoverSelectedTransport,
+    validatePersistedSession,
+  ]);
+
+  useEffect(() => {
+    if (initializationStartedRef.current) return;
+    initializationStartedRef.current = true;
+
+    const initializeApp = async () => {
+      const generation = ++transportOperationGenerationRef.current;
+      const canPublishTransport = () =>
+        generation === transportOperationGenerationRef.current &&
+        appStateRef.current === "active";
+      let resolveInitialConfiguration!: () => void;
+      initialConfigurationReadyRef.current = new Promise<void>((resolve) => {
+        resolveInitialConfiguration = resolve;
+      });
+
+      blockServerTransportRequests();
+      setTransportState("recovering");
+      try {
+        setIsLoading(true);
+        try {
+          await initializeServerConfig({
+            rehydrateTailscale: false,
+            detect: false,
+          });
+        } finally {
+          // Foreground recovery may have started while storage was loading. It
+          // must not inspect transport metadata until this initial read settles.
+          resolveInitialConfiguration();
+        }
 
         const serverConfig = await AsyncStorage.getItem("serverConfig");
         const legacyServer = await AsyncStorage.getItem("server");
-
         const serverConfigured = !!(serverConfig || legacyServer);
         setHasServerConfigured(serverConfigured);
         setSelectedServer(
-          serverConfig || legacyServer
+          serverConfigured
             ? {
                 name: "Server",
                 ip: getDisplayServerUrl() || getCurrentServerUrl() || "Server",
@@ -192,40 +422,47 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         );
 
         if (serverConfigured) {
-          let displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
-          if (!displayUrl && serverConfig) {
-            try {
-              const parsed = JSON.parse(serverConfig) as {
-                displayUrl?: string;
-                serverUrl?: string;
-              };
-              displayUrl = parsed.displayUrl || parsed.serverUrl || null;
-            } catch {
-              displayUrl = null;
+          const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
+          const config = getServerConfigMeta();
+          const tsConfigured = await isTailscaleConfigured();
+          let transportCommitted = false;
+
+          if (displayUrl && config?.viaTailscale) {
+            const live = await getLiveTransportUrl(displayUrl);
+            if (live && canPublishTransport()) {
+              await setRuntimeTransportUrl(live, { detect: false });
+              if (canPublishTransport()) {
+                await detectServerRoutes();
+              }
+              if (canPublishTransport()) {
+                markTransportReady();
+                resolveNetworkModePrompt("tailscale");
+                transportCommitted = true;
+              }
             }
           }
 
-          // If a Tailscale auth key is saved and no live forward exists, ask
-          // whether this session should use Tailscale or direct/LAN.
-          // This MUST happen before any network calls (getVersionInfo etc.) so
-          // cellular users are not blocked by a 30s timeout to an unreachable LAN IP.
-          const tsConfigured = await isTailscaleConfigured();
-          const live =
-            displayUrl && tsConfigured
-              ? getLiveTransportUrl(displayUrl)
-              : null;
-          if (tsConfigured && displayUrl && !live) {
-            setIsLoading(false);
+          if (
+            !transportCommitted &&
+            displayUrl &&
+            (tsConfigured || config?.viaTailscale) &&
+            canPublishTransport()
+          ) {
+            // Keep the route tree behind the loading screen. The provider-level
+            // Modal remains visible and resolves only after a transport succeeds.
             await promptNetworkMode(displayUrl);
-            // Choice handler already applied transport mode + re-detected.
-            setIsLoading(true);
+            transportCommitted = canPublishTransport();
           }
 
-          // Restore persisted login WITHOUT letting a slow/offline server
-          // destroy the session. The Tailscale chooser above happens first so
-          // the transport is correct before we validate the JWT.
-          const jwtToken = await AsyncStorage.getItem("jwt");
+          if (!transportCommitted && canPublishTransport()) {
+            await detectServerRoutes();
+            if (canPublishTransport()) {
+              markTransportReady();
+              transportCommitted = true;
+            }
+          }
 
+          const jwtToken = await AsyncStorage.getItem("jwt");
           if (jwtToken) {
             const validationPromise = getUserInfo();
             const validationResult = await Promise.race([
@@ -253,9 +490,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
               await clearAuth();
               setAuthenticated(false);
             } else {
-              // A slow/offline server must not destroy the persisted session.
-              // If the request is still running, apply its eventual authoritative
-              // response after the app has opened.
               setAuthenticated(true);
               if (validationResult.type === "timeout") {
                 void validationPromise
@@ -277,40 +511,56 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
             setAuthenticated(false);
           }
 
-          // Server/version availability must not delay or determine whether
-          // local state can be restored on launch.
           void getVersionInfo().catch((error) => {
             console.warn("[AppContext] Version check failed:", error);
           });
         } else {
-          // Brand-new install: guide the user, but the flow is dismissible.
+          if (canPublishTransport()) {
+            markTransportReady();
+          }
           setAuthenticated(false);
           openAuthFlow("server");
         }
 
         void checkShouldShowUpdateScreen().then(setShowUpdateScreen);
       } catch (error) {
-        const serverUrl = getCurrentServerUrl();
-        setHasServerConfigured(!!serverUrl);
-        setSelectedServer(serverUrl ? { name: "Server", ip: serverUrl } : null);
+        const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
+        setHasServerConfigured(!!displayUrl);
+        setSelectedServer(
+          displayUrl ? { name: "Server", ip: displayUrl } : null,
+        );
         setAuthenticated(false);
-        if (!serverUrl) {
-          openAuthFlow("server");
+
+        if (canPublishTransport()) {
+          if (displayUrl) {
+            const message = markTransportFailed(error);
+            await promptNetworkMode(displayUrl, message);
+          } else {
+            markTransportReady();
+            openAuthFlow("server");
+          }
         }
         console.error("[AppContext] Failed to initialize app:", error);
       } finally {
-        setIsLoading(false);
+        if (canPublishTransport()) {
+          setIsLoading(false);
+        }
       }
     };
 
-    initializeApp();
-  }, [openAuthFlow, promptNetworkMode]);
+    void initializeApp();
+  }, [
+    checkShouldShowUpdateScreen,
+    markTransportFailed,
+    markTransportReady,
+    openAuthFlow,
+    promptNetworkMode,
+    resolveNetworkModePrompt,
+  ]);
 
   useEffect(() => {
     setAuthStateCallback((authed: boolean) => {
       if (!authed) {
-        // Critical API 401: clear only the invalid JWT. The configured server
-        // remains available so the user sees "Sign in", not "Add server".
         setAuthenticated(false);
         clearCachedUserId();
         void clearAuth();
@@ -318,54 +568,27 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     });
   }, []);
 
-  const lastValidationTimeRef = useRef<number>(0);
-  const validationInProgressRef = useRef<boolean>(false);
-
   useEffect(() => {
-    const handleAppStateChange = async (nextAppState: AppStateStatus) => {
-      if (
-        nextAppState === "active" &&
-        isAuthenticated &&
-        !validationInProgressRef.current
-      ) {
-        const now = Date.now();
-        const timeSinceLastValidation = now - lastValidationTimeRef.current;
+    const handleAppStateChange = (nextAppState: AppStateStatus) => {
+      appStateRef.current = nextAppState;
 
-        if (timeSinceLastValidation < 2000) {
-          return;
-        }
-
-        validationInProgressRef.current = true;
-        lastValidationTimeRef.current = now;
-
-        try {
-          const userInfo = await getUserInfo();
-
-          if (
-            !userInfo ||
-            !userInfo.username ||
-            userInfo.data_unlocked === false
-          ) {
-            setAuthenticated(false);
-          }
-        } catch (error) {
-          // Network blips shouldn't log the user out; the 401 callback handles
-          // genuine auth failures.
-        } finally {
-          validationInProgressRef.current = false;
-        }
+      if (nextAppState !== "active") {
+        transportOperationGenerationRef.current += 1;
+        foregroundRecoveryRef.current = null;
+        blockServerTransportRequests();
+        setTransportState("recovering");
+        return;
       }
+
+      void runForegroundRecovery();
     };
 
     const subscription = AppState.addEventListener(
       "change",
       handleAppStateChange,
     );
-
-    return () => {
-      subscription.remove();
-    };
-  }, [isAuthenticated]);
+    return () => subscription.remove();
+  }, [runForegroundRecovery]);
 
   // Keep hasServerConfigured in sync whenever the auth flow closes (the user
   // may have just added or changed a server inside it).
@@ -388,6 +611,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         setIsLoading,
         hasServerConfigured,
         setHasServerConfigured,
+        transportState,
+        transportReadyEpoch,
         authFlowVisible,
         authFlowInitialStep,
         openAuthFlow,
@@ -399,6 +624,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         visible={networkModeVisible}
         busy={networkModeBusy}
         serverLabel={networkModeServerLabel}
+        errorMessage={networkModeError}
         onChoose={(mode) => {
           void handleNetworkModeChoice(mode);
         }}

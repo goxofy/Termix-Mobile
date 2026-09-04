@@ -29,6 +29,7 @@ function RootLayoutContent() {
     showUpdateScreen,
     isLoading,
     setIsLoading,
+    transportState,
   } = useAppContext();
   const accent = useThemeColor()("accent-brand");
 
@@ -42,20 +43,22 @@ function RootLayoutContent() {
         >
           Initializing…
         </Text>
-        <TouchableOpacity
-          onPress={() => {
-            setIsLoading(false);
-            openAuthFlow("server");
-          }}
-          className="mt-6 border border-border bg-card px-6 py-3"
-        >
-          <Text
-            className="text-foreground"
-            style={{ fontFamily: MONO_FONT_BOLD }}
+        {transportState === "ready" ? (
+          <TouchableOpacity
+            onPress={() => {
+              setIsLoading(false);
+              openAuthFlow("server");
+            }}
+            className="mt-6 border border-border bg-card px-6 py-3"
           >
-            Cancel
-          </Text>
-        </TouchableOpacity>
+            <Text
+              className="text-foreground"
+              style={{ fontFamily: MONO_FONT_BOLD }}
+            >
+              Cancel
+            </Text>
+          </TouchableOpacity>
+        ) : null}
       </View>
     );
   }

@@ -43,7 +43,6 @@ import {
   getCurrentServerUrl,
   getDisplayServerUrl,
   initializeServerConfig,
-  setRuntimeTransportUrl,
   setCookie,
   getUserInfo,
   loginUser,
@@ -280,19 +279,21 @@ export default function AuthFlow() {
       // Persist the user-facing URL on disk. Runtime transport (localhost forward)
       // is applied in memory only — otherwise Hosts re-init would treat a dead
       // 127.0.0.1 port as the server and hang after login.
-      const saved = await saveServerConfig({
-        serverUrl: displayUrl,
-        displayUrl,
-        viaTailscale,
-        lastUpdated: new Date().toISOString(),
-      });
+      const saved = await saveServerConfig(
+        {
+          serverUrl: displayUrl,
+          displayUrl,
+          viaTailscale,
+          lastUpdated: new Date().toISOString(),
+        },
+        {
+          runtimeUrl: viaTailscale ? transportUrl : undefined,
+        },
+      );
       if (!saved) {
         throw new Error(
           "Could not save the server address on this device. Please try again.",
         );
-      }
-      if (viaTailscale && transportUrl !== displayUrl) {
-        await setRuntimeTransportUrl(transportUrl);
       }
       setSelectedServer({ name: "Server", ip: displayUrl });
 
@@ -660,7 +661,7 @@ function ServerStep({
           Using a self-signed certificate? Install its root CA on your device
           first. Local HTTP servers are supported.
           {useTailscale
-            ? " Tailscale forwards use cleartext TCP to the remote port via localhost — prefer HTTP on the private backend."
+            ? " Tailscale keeps the app-side hop on localhost and validates HTTPS certificates against the original server hostname."
             : ""}
         </Text>
       </View>

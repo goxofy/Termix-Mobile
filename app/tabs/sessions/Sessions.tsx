@@ -44,8 +44,13 @@ import BottomToolbar from "@/app/tabs/sessions/terminal/keyboard/BottomToolbar";
 import KeyboardBar from "@/app/tabs/sessions/terminal/keyboard/KeyboardBar";
 import { useOrientation } from "@/app/utils/orientation";
 import { getMaxKeyboardHeight, getTabBarHeight } from "@/app/utils/responsive";
-import { BACKGROUNDS, BORDER_COLORS, RADIUS } from "@/app/constants/designTokens";
+import {
+  BACKGROUNDS,
+  BORDER_COLORS,
+  RADIUS,
+} from "@/app/constants/designTokens";
 import { addKeyCommandListener } from "@/modules/hardware-keyboard";
+import { useAppContext } from "@/app/AppContext";
 import TerminalImeInput, {
   type TerminalImeInputHandle,
 } from "@/modules/terminal-ime-input";
@@ -66,6 +71,7 @@ type ActiveModifiers = {
 
 export default function Sessions() {
   const insets = useSafeAreaInsets();
+  const { transportState, transportReadyEpoch } = useAppContext();
   const router = useRouter();
   const { height, isLandscape } = useOrientation();
   const isIPad = Platform.OS === "ios" && Platform.isPad;
@@ -87,6 +93,8 @@ export default function Sessions() {
   const [showConnectionsPanel, setShowConnectionsPanel] = useState(false);
   const { keyboardHeight, isKeyboardVisible } = useKeyboard();
   const hiddenInputRef = useRef<TerminalImeInputHandle | null>(null);
+  const appStateRef = useRef(AppState.currentState);
+  const lastTransportReadyEpochRef = useRef(transportReadyEpoch);
   const terminalRefs = useRef<Record<string, React.RefObject<TerminalHandle>>>(
     {},
   );
@@ -174,7 +182,9 @@ export default function Sessions() {
       }
 
       const now = Date.now();
-      if (isDuplicateTerminalSpecialKey(lastSpecialKeyRef.current, event, now)) {
+      if (
+        isDuplicateTerminalSpecialKey(lastSpecialKeyRef.current, event, now)
+      ) {
         return;
       }
 
@@ -206,8 +216,13 @@ export default function Sessions() {
     const show = Keyboard.addListener("keyboardDidShow", () => {
       if (activeSession?.type === "remoteDesktop") setIsRdpKeyboardOpen(true);
     });
-    const hide = Keyboard.addListener("keyboardDidHide", () => setIsRdpKeyboardOpen(false));
-    return () => { show.remove(); hide.remove(); };
+    const hide = Keyboard.addListener("keyboardDidHide", () =>
+      setIsRdpKeyboardOpen(false),
+    );
+    return () => {
+      show.remove();
+      hide.remove();
+    };
   }, [activeSession?.type]);
 
   const getTabBarBottomPosition = () => {
@@ -328,16 +343,9 @@ export default function Sessions() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextAppState) => {
+      const previousAppState = appStateRef.current;
+      appStateRef.current = nextAppState;
       if (nextAppState === "active") {
-        sessions.forEach((session) => {
-          if (session.type === "terminal") {
-            const terminalRef = terminalRefs.current[session.id];
-            if (terminalRef?.current) {
-              terminalRef.current.notifyForegrounded();
-            }
-          }
-        });
-
         if (
           sessions.length > 0 &&
           activeSession?.type === "terminal" &&
@@ -348,22 +356,39 @@ export default function Sessions() {
             hiddenInputRef.current?.focus();
           }, 500);
         }
-      } else if (nextAppState === "background") {
+      } else if (previousAppState === "active") {
         sessions.forEach((session) => {
           if (session.type === "terminal") {
-            const terminalRef = terminalRefs.current[session.id];
-            if (terminalRef?.current) {
-              terminalRef.current.notifyBackgrounded();
-            }
+            terminalRefs.current[session.id]?.current?.notifyBackgrounded();
           }
         });
       }
     });
 
-    return () => {
-      subscription.remove();
-    };
-  }, [sessions, activeSession?.type, isCustomKeyboardVisible]);
+    return () => subscription.remove();
+  }, [
+    sessions,
+    activeSession?.type,
+    isCustomKeyboardVisible,
+    keyboardIntentionallyHiddenRef,
+  ]);
+
+  useEffect(() => {
+    if (
+      transportState !== "ready" ||
+      appStateRef.current !== "active" ||
+      transportReadyEpoch <= lastTransportReadyEpochRef.current
+    ) {
+      return;
+    }
+
+    lastTransportReadyEpochRef.current = transportReadyEpoch;
+    sessions.forEach((session) => {
+      if (session.type === "terminal") {
+        terminalRefs.current[session.id]?.current?.notifyForegrounded();
+      }
+    });
+  }, [sessions, transportReadyEpoch, transportState]);
 
   useEffect(() => {
     if (Platform.OS === "android" && sessions.length > 0) {
@@ -544,7 +569,11 @@ export default function Sessions() {
       setKeyboardIntentionallyHidden(false);
       setTimeout(() => hiddenInputRef.current?.focus(), 100);
     }
-  }, [activeSession?.type, isCustomKeyboardVisible, setKeyboardIntentionallyHidden]);
+  }, [
+    activeSession?.type,
+    isCustomKeyboardVisible,
+    setKeyboardIntentionallyHidden,
+  ]);
 
   const handleAddSession = () => {
     router.navigate("/hosts" as any);
@@ -597,16 +626,25 @@ export default function Sessions() {
       LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
       toggleCustomKeyboard();
       setKeyboardIntentionallyHidden(false);
-      requestAnimationFrame(() => { hiddenInputRef.current?.blur(); });
+      requestAnimationFrame(() => {
+        hiddenInputRef.current?.blur();
+      });
       setTimeout(() => {
-        const activeRef = activeSessionId ? terminalRefs.current[activeSessionId] : null;
+        const activeRef = activeSessionId
+          ? terminalRefs.current[activeSessionId]
+          : null;
         if (activeRef?.current) {
           activeRef.current.fit();
           setTimeout(() => activeRef.current?.scrollToBottom(), 50);
         }
       }, 300);
     }
-  }, [isCustomKeyboardVisible, toggleCustomKeyboard, setKeyboardIntentionallyHidden, activeSessionId]);
+  }, [
+    isCustomKeyboardVisible,
+    toggleCustomKeyboard,
+    setKeyboardIntentionallyHidden,
+    activeSessionId,
+  ]);
 
   const handleModifierChange = useCallback((modifiers: ActiveModifiers) => {
     setActiveModifiers(modifiers);
@@ -773,10 +811,7 @@ export default function Sessions() {
                 }}
               >
                 <View style={{ flex: 1 }}>
-                  <Text
-                    weight="bold"
-                    className="text-base text-foreground"
-                  >
+                  <Text weight="bold" className="text-base text-foreground">
                     Connections
                   </Text>
                 </View>
