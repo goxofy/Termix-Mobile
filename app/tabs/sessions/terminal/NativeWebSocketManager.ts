@@ -1,4 +1,16 @@
-import { getCurrentServerUrl, getCookie } from "../../../main-axios";
+import * as mainAxios from "../../../main-axios";
+
+type MainAxiosWithTransportBarrier = typeof mainAxios & {
+  waitForServerTransportReady?: () => Promise<void>;
+};
+
+async function waitForServerTransportReady(): Promise<void> {
+  const waitForReady = (mainAxios as MainAxiosWithTransportBarrier)
+    .waitForServerTransportReady;
+  if (waitForReady) {
+    await waitForReady();
+  }
+}
 
 export interface TerminalHostConfig {
   id: number;
@@ -56,10 +68,16 @@ export interface NativeWSConfig {
   onPostConnectionSetup: () => void;
   onDisconnected: (hostName: string) => void;
   onConnectionFailed: (message: string) => void;
+  /** Fired once when the backend reports that the terminal session ended. */
+  onSessionEnded: () => void;
   /** Fired when the backend session id is created/attached/cleared. */
   onSessionIdChange?: (sessionId: string | null) => void;
   /** Fired for each `connection_log` WS message from the server. */
-  onConnectionLog?: (entry: { level?: string; stage?: string; message: string }) => void;
+  onConnectionLog?: (entry: {
+    level?: string;
+    stage?: string;
+    message: string;
+  }) => void;
 }
 
 export class NativeWebSocketManager {
@@ -78,9 +96,10 @@ export class NativeWebSocketManager {
   private isReconnectFromBackground = false;
   private currentConnectionFromBackground = false;
   private destroyed = false;
+  private sessionEnded = false;
+  private connectionGeneration = 0;
   private cols = 80;
   private rows = 24;
-  private wsUrl: string | null = null;
   private serverSessionId: string | null = null;
   private pendingReattach = false;
   private awaitingAuthCredentials = false;
@@ -100,60 +119,34 @@ export class NativeWebSocketManager {
   }
 
   async connect(cols: number, rows: number): Promise<void> {
-    if (this.destroyed) return;
+    if (this.destroyed || this.sessionEnded) return;
 
     this.cols = cols;
     this.rows = rows;
 
-    const serverUrl = getCurrentServerUrl();
-    if (!serverUrl) {
-      this.config.onConnectionFailed(
-        "No server URL found - please configure a server first",
-      );
-      return;
-    }
-
-    const jwtToken = await getCookie("jwt");
-    if (!jwtToken || jwtToken.trim() === "") {
-      this.config.onConnectionFailed(
-        "Authentication required - please log in again",
-      );
-      return;
-    }
-
-    const wsProtocol = serverUrl.startsWith("https://") ? "wss://" : "ws://";
-    const wsHost = serverUrl.replace(/^https?:\/\//, "");
-    const cleanHost = wsHost.replace(/\/$/, "");
-    this.wsUrl = `${wsProtocol}${cleanHost}/ssh/websocket/?token=${encodeURIComponent(jwtToken)}`;
-
-    this.connectWebSocket();
+    await this.connectWebSocket();
   }
 
   destroy(): void {
+    if (this.destroyed) return;
+
     this.destroyed = true;
     this.shouldNotReconnect = true;
     this.awaitingAuthCredentials = false;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    this.connectionGeneration += 1;
+
+    const ws = this.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-        this.ws.send(JSON.stringify({ type: "disconnect" }));
+        ws.send(JSON.stringify({ type: "disconnect" }));
       } catch (_) {}
     }
-    this.serverSessionId = null;
+
+    this.setServerSessionId(null);
+    this.pendingReattach = false;
     this.clearAllTimers();
-    if (this.ws) {
-      try {
-        this.ws.onopen = null;
-        this.ws.onmessage = null;
-        this.ws.onclose = null;
-        this.ws.onerror = null;
-        if (
-          this.ws.readyState === WebSocket.OPEN ||
-          this.ws.readyState === WebSocket.CONNECTING
-        ) {
-          this.ws.close(1000, "Component unmounted");
-        }
-      } catch (_) {}
-      this.ws = null;
+    if (ws) {
+      this.detachAndCloseSocket(ws, 1000, "Component unmounted");
     }
   }
 
@@ -240,16 +233,16 @@ export class NativeWebSocketManager {
       return;
     }
 
-    // Clear any pending connection timeout before starting a new connect to
-    // prevent the old timer from closing the newly-created socket.
     this.clearAllTimers();
-    this.connectWebSocket();
+    void this.connectWebSocket();
   }
 
   sendWarpgateContinue(): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
-        this.ws.send(JSON.stringify({ type: "warpgate_auth_continue", data: {} }));
+        this.ws.send(
+          JSON.stringify({ type: "warpgate_auth_continue", data: {} }),
+        );
       } catch (_) {}
     }
   }
@@ -262,7 +255,10 @@ export class NativeWebSocketManager {
             type: "reconnect_with_credentials",
             data: {
               keyPassword: passphrase,
-              hostConfig: { ...this.config.hostConfig, keyPassword: passphrase },
+              hostConfig: {
+                ...this.config.hostConfig,
+                keyPassword: passphrase,
+              },
               cols: this.cols,
               rows: this.rows,
             },
@@ -278,100 +274,124 @@ export class NativeWebSocketManager {
     this.reconnectAttempts = 0;
     this.stopPingInterval();
     this.clearReconnectTimeout();
-    if (this.connectionTimeout) {
-      clearTimeout(this.connectionTimeout);
-      this.connectionTimeout = null;
-    }
+    this.clearConnectionTimeout();
   }
 
   notifyForegrounded(): void {
     const wasInBackground = this.isAppInBackground;
     this.isAppInBackground = false;
+    this.backgroundTime = null;
 
-    if (!wasInBackground) return;
-    if (this.destroyed) return;
+    if (!wasInBackground || this.destroyed || this.sessionEnded) return;
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.startPingInterval();
+    const viaTailscale = !!mainAxios.getServerConfigMeta()?.viaTailscale;
+    const ws = this.ws;
+    if (!viaTailscale && ws && ws.readyState === WebSocket.OPEN) {
+      this.isReconnectFromBackground = false;
+      this.startPingInterval(ws, this.connectionGeneration);
       return;
     }
 
     this.isReconnectFromBackground = true;
     this.reconnectAttempts = 0;
+    this.connectionGeneration += 1;
+    this.clearAllTimers();
 
-    if (this.ws) {
-      try {
-        this.ws.onclose = null;
-        this.ws.onerror = null;
-        this.ws.onopen = null;
-        this.ws.onmessage = null;
-        this.ws.close();
-      } catch (_) {}
-      this.ws = null;
+    if (ws) {
+      this.detachAndCloseSocket(ws);
     }
-    this.stopPingInterval();
 
-    this.connectWebSocket();
+    void this.connectWebSocket();
   }
 
-  private connectWebSocket(): void {
-    if (this.destroyed) return;
+  private async connectWebSocket(): Promise<void> {
+    if (this.destroyed || this.sessionEnded || this.isAppInBackground) return;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
 
-    if (!this.wsUrl) {
-      this.notifyFailureOnce(
-        "No WebSocket URL available - server not configured",
-      );
-      return;
-    }
+    this.clearReconnectTimeout();
+    this.clearConnectionTimeout();
+    this.stopPingInterval();
+    this.clearPongTimeout();
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      return;
-    }
-
-    if (this.ws) {
-      try {
-        this.ws.onopen = null;
-        this.ws.onclose = null;
-        this.ws.onerror = null;
-        this.ws.onmessage = null;
-        if (
-          this.ws.readyState === WebSocket.CONNECTING ||
-          this.ws.readyState === WebSocket.OPEN
-        ) {
-          this.ws.close();
-        }
-      } catch (_) {}
+    const previousSocket = this.ws;
+    const generation = ++this.connectionGeneration;
+    if (previousSocket) {
+      this.detachAndCloseSocket(previousSocket);
     }
 
     this.config.onStateChange("connecting", {
       retryCount: this.reconnectAttempts,
     });
 
-    const ws = new WebSocket(this.wsUrl);
-    this.ws = ws;
+    try {
+      await waitForServerTransportReady();
+      if (!this.isCurrentAttempt(generation) || this.isAppInBackground) return;
 
-    this.connectionTimeout = setTimeout(() => {
+      const jwtToken = await mainAxios.getCookie("jwt");
+      if (!this.isCurrentAttempt(generation) || this.isAppInBackground) return;
+
+      const serverUrl = mainAxios.getCurrentServerUrl();
+      if (!serverUrl) {
+        this.config.onConnectionFailed(
+          "No server URL found - please configure a server first",
+        );
+        return;
+      }
+
+      if (!jwtToken || jwtToken.trim() === "") {
+        this.config.onConnectionFailed(
+          "Authentication required - please log in again",
+        );
+        return;
+      }
+
+      const wsProtocol = serverUrl.startsWith("https://") ? "wss://" : "ws://";
+      const wsHost = serverUrl.replace(/^https?:\/\//, "").replace(/\/$/, "");
+      const wsUrl = `${wsProtocol}${wsHost}/ssh/websocket/?token=${encodeURIComponent(jwtToken)}`;
+
+      if (!this.isCurrentAttempt(generation) || this.isAppInBackground) return;
+
+      const ws = new WebSocket(wsUrl);
+      if (!this.isCurrentAttempt(generation)) {
+        this.detachAndCloseSocket(ws);
+        return;
+      }
+      this.ws = ws;
+      this.configureSocket(ws, generation);
+    } catch (_) {
+      if (!this.isCurrentAttempt(generation) || this.isAppInBackground) return;
+      this.scheduleReconnect(generation);
+    }
+  }
+
+  private configureSocket(ws: WebSocket, generation: number): void {
+    const connectionTimeout = setTimeout(() => {
+      if (
+        this.connectionTimeout !== connectionTimeout ||
+        !this.isCurrentSocket(ws, generation)
+      ) {
+        return;
+      }
+      this.connectionTimeout = null;
+
       if (ws.readyState === WebSocket.CONNECTING) {
-        try {
-          ws.onclose = null;
-          ws.close();
-        } catch (_) {}
+        this.detachAndCloseSocket(ws);
         if (
           !this.shouldNotReconnect &&
           this.reconnectAttempts < this.maxReconnectAttempts
         ) {
-          this.scheduleReconnect();
+          this.scheduleReconnect(generation);
         } else {
           this.notifyFailureOnce("Connection timeout - server not responding");
         }
       }
     }, 10000);
+    this.connectionTimeout = connectionTimeout;
 
     ws.onopen = () => {
-      if (this.connectionTimeout) {
-        clearTimeout(this.connectionTimeout);
-        this.connectionTimeout = null;
-      }
+      if (!this.isCurrentSocket(ws, generation)) return;
+
+      this.clearConnectionTimeout();
       this.clearReconnectTimeout();
 
       this.hasNotifiedFailure = false;
@@ -380,38 +400,44 @@ export class NativeWebSocketManager {
       this.currentConnectionFromBackground = this.isReconnectFromBackground;
       this.isReconnectFromBackground = false;
 
-      if (this.serverSessionId) {
-        this.pendingReattach = true;
-        ws.send(
-          JSON.stringify({
-            type: "attachSession",
-            data: {
-              sessionId: this.serverSessionId,
-              cols: this.cols,
-              rows: this.rows,
-              tabInstanceId: this.config.tabInstanceId,
-            },
-          }),
-        );
-      } else {
-        ws.send(
-          JSON.stringify({
-            type: "connectToHost",
-            data: {
-              cols: this.cols,
-              rows: this.rows,
-              hostConfig: this.config.hostConfig,
-              tabInstanceId: this.config.tabInstanceId,
-            },
-          }),
-        );
+      try {
+        if (this.serverSessionId) {
+          this.pendingReattach = true;
+          ws.send(
+            JSON.stringify({
+              type: "attachSession",
+              data: {
+                sessionId: this.serverSessionId,
+                cols: this.cols,
+                rows: this.rows,
+                tabInstanceId: this.config.tabInstanceId,
+              },
+            }),
+          );
+        } else {
+          this.pendingReattach = false;
+          ws.send(
+            JSON.stringify({
+              type: "connectToHost",
+              data: {
+                cols: this.cols,
+                rows: this.rows,
+                hostConfig: this.config.hostConfig,
+                tabInstanceId: this.config.tabInstanceId,
+              },
+            }),
+          );
+        }
+      } catch (_) {
+        this.handleSocketError(ws, generation);
+        return;
       }
 
-      this.startPingInterval();
+      this.startPingInterval(ws, generation);
     };
 
     ws.onmessage = (event: MessageEvent) => {
-      if (this.destroyed) return;
+      if (!this.isCurrentSocket(ws, generation)) return;
       try {
         const msg = JSON.parse(event.data as string);
 
@@ -440,10 +466,7 @@ export class NativeWebSocketManager {
           this.shouldNotReconnect = true;
           this.config.onAuthDialogNeeded("no_keyboard");
         } else if (msg.type === "host_key_verification_required") {
-          if (this.connectionTimeout) {
-            clearTimeout(this.connectionTimeout);
-            this.connectionTimeout = null;
-          }
+          this.clearConnectionTimeout();
           if (this.config.onHostKeyVerificationRequired) {
             this.config.onHostKeyVerificationRequired(
               "new",
@@ -456,10 +479,7 @@ export class NativeWebSocketManager {
             );
           }
         } else if (msg.type === "host_key_changed") {
-          if (this.connectionTimeout) {
-            clearTimeout(this.connectionTimeout);
-            this.connectionTimeout = null;
-          }
+          this.clearConnectionTimeout();
           if (this.config.onHostKeyVerificationRequired) {
             this.config.onHostKeyVerificationRequired(
               "changed",
@@ -472,16 +492,10 @@ export class NativeWebSocketManager {
             );
           }
         } else if (msg.type === "passphrase_required") {
-          if (this.connectionTimeout) {
-            clearTimeout(this.connectionTimeout);
-            this.connectionTimeout = null;
-          }
+          this.clearConnectionTimeout();
           this.config.onPassphraseRequired?.();
         } else if (msg.type === "warpgate_auth_required") {
-          if (this.connectionTimeout) {
-            clearTimeout(this.connectionTimeout);
-            this.connectionTimeout = null;
-          }
+          this.clearConnectionTimeout();
           this.config.onWarpgateAuthRequired?.(
             (msg.url as string) || "",
             (msg.securityKey as string) || "",
@@ -520,6 +534,8 @@ export class NativeWebSocketManager {
         } else if (msg.type === "disconnected") {
           this.setServerSessionId(null);
           this.config.onDisconnected(this.config.hostConfig.name);
+        } else if (msg.type === "session_ended") {
+          this.handleSessionEnded(ws, generation);
         } else if (msg.type === "pong") {
           this.clearPongTimeout();
         } else if (msg.type === "resized") {
@@ -530,8 +546,8 @@ export class NativeWebSocketManager {
         } else if (msg.type === "sessionExpired") {
           this.setServerSessionId(null);
           this.pendingReattach = false;
-          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
               JSON.stringify({
                 type: "connectToHost",
                 data: {
@@ -549,7 +565,9 @@ export class NativeWebSocketManager {
           this.config.onDisconnected(this.config.hostConfig.name);
         } else if (msg.type === "connection_log") {
           if (msg.data) {
-            this.config.onConnectionLog?.(msg.data as { level?: string; stage?: string; message: string });
+            this.config.onConnectionLog?.(
+              msg.data as { level?: string; stage?: string; message: string },
+            );
           }
         }
       } catch (_) {
@@ -558,24 +576,20 @@ export class NativeWebSocketManager {
     };
 
     ws.onclose = (event: CloseEvent) => {
-      if (this.connectionTimeout) {
-        clearTimeout(this.connectionTimeout);
-        this.connectionTimeout = null;
-      }
+      if (!this.isCurrentSocket(ws, generation)) return;
+
+      this.clearConnectionTimeout();
       this.stopPingInterval();
       this.clearPongTimeout();
-      // Only reset awaitingAuthCredentials when the connection closed without
-      // us actively waiting for user input (e.g. network drop). If shouldNotReconnect
-      // is set alongside it, we're mid-auth-dialog — leave both intact.
+      this.detachSocketHandlers(ws);
+      this.ws = null;
+
+      // Keep auth-dialog state intact while waiting for user input.
       if (!this.shouldNotReconnect) {
         this.awaitingAuthCredentials = false;
       }
 
-      if (this.isAppInBackground) {
-        return;
-      }
-
-      if (this.destroyed) return;
+      if (this.isAppInBackground || this.destroyed || this.sessionEnded) return;
 
       if (this.shouldNotReconnect) {
         this.notifyFailureOnce("Connection closed");
@@ -587,23 +601,30 @@ export class NativeWebSocketManager {
         return;
       }
 
-      this.scheduleReconnect();
+      this.scheduleReconnect(generation);
     };
 
     ws.onerror = () => {
-      if (this.connectionTimeout) {
-        clearTimeout(this.connectionTimeout);
-        this.connectionTimeout = null;
-      }
+      if (!this.isCurrentSocket(ws, generation)) return;
+
+      this.clearConnectionTimeout();
+      if (this.shouldNotReconnect) return;
+
+      this.handleSocketError(ws, generation);
     };
   }
 
-  private scheduleReconnect(): void {
-    if (this.shouldNotReconnect || this.destroyed) return;
-
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+  private scheduleReconnect(generation: number): void {
+    if (
+      !this.isCurrentAttempt(generation) ||
+      this.shouldNotReconnect ||
+      this.isAppInBackground ||
+      this.reconnectTimeout
+    ) {
       return;
     }
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.notifyFailureOnce("Maximum reconnection attempts reached");
@@ -611,7 +632,6 @@ export class NativeWebSocketManager {
     }
 
     this.reconnectAttempts += 1;
-
     const delay = Math.min(
       1000 * Math.pow(2, this.reconnectAttempts - 1),
       5000,
@@ -621,40 +641,54 @@ export class NativeWebSocketManager {
       retryCount: this.reconnectAttempts,
     });
 
-    this.clearReconnectTimeout();
-
-    this.reconnectTimeout = setTimeout(() => {
+    const reconnectTimeout = setTimeout(() => {
+      if (
+        this.reconnectTimeout !== reconnectTimeout ||
+        !this.isCurrentAttempt(generation)
+      ) {
+        return;
+      }
       this.reconnectTimeout = null;
-      if (this.destroyed) return;
       if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
-      this.connectWebSocket();
+      void this.connectWebSocket();
     }, delay);
+    this.reconnectTimeout = reconnectTimeout;
   }
 
-  private startPingInterval(): void {
+  private startPingInterval(ws: WebSocket, generation: number): void {
     this.stopPingInterval();
-    this.pingInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          this.ws.send(JSON.stringify({ type: "ping" }));
-          // Start a pong timeout — if no pong arrives within 10s the connection
-          // is silently dead (TCP hang) and we need to force-reconnect.
-          this.clearPongTimeout();
-          this.pongTimeout = setTimeout(() => {
-            this.pongTimeout = null;
-            if (this.destroyed || this.isAppInBackground) return;
-            if (this.ws) {
-              try {
-                this.ws.onclose = null;
-                this.ws.close();
-              } catch (_) {}
-              this.ws = null;
-            }
-            this.scheduleReconnect();
-          }, 10000);
-        } catch (_) {}
+    if (this.isAppInBackground || !this.isCurrentSocket(ws, generation)) return;
+
+    const pingInterval = setInterval(() => {
+      if (
+        this.pingInterval !== pingInterval ||
+        !this.isCurrentSocket(ws, generation)
+      ) {
+        return;
+      }
+      if (ws.readyState !== WebSocket.OPEN) return;
+
+      try {
+        ws.send(JSON.stringify({ type: "ping" }));
+        this.clearPongTimeout();
+
+        const pongTimeout = setTimeout(() => {
+          if (
+            this.pongTimeout !== pongTimeout ||
+            !this.isCurrentSocket(ws, generation)
+          ) {
+            return;
+          }
+          this.pongTimeout = null;
+          if (this.isAppInBackground) return;
+          this.handleSocketError(ws, generation);
+        }, 10000);
+        this.pongTimeout = pongTimeout;
+      } catch (_) {
+        this.handleSocketError(ws, generation);
       }
     }, 25000);
+    this.pingInterval = pingInterval;
   }
 
   private stopPingInterval(): void {
@@ -678,14 +712,85 @@ export class NativeWebSocketManager {
     }
   }
 
-  private clearAllTimers(): void {
-    this.stopPingInterval();
-    this.clearReconnectTimeout();
-    this.clearPongTimeout();
+  private clearConnectionTimeout(): void {
     if (this.connectionTimeout) {
       clearTimeout(this.connectionTimeout);
       this.connectionTimeout = null;
     }
+  }
+
+  private isCurrentAttempt(generation: number): boolean {
+    return (
+      !this.destroyed &&
+      !this.sessionEnded &&
+      generation === this.connectionGeneration
+    );
+  }
+
+  private isCurrentSocket(ws: WebSocket, generation: number): boolean {
+    return this.isCurrentAttempt(generation) && this.ws === ws;
+  }
+
+  private handleSocketError(ws: WebSocket, generation: number): void {
+    if (!this.isCurrentSocket(ws, generation) || this.shouldNotReconnect)
+      return;
+
+    this.clearConnectionTimeout();
+    this.stopPingInterval();
+    this.clearPongTimeout();
+    this.detachAndCloseSocket(ws);
+
+    if (!this.isAppInBackground) {
+      this.scheduleReconnect(generation);
+    }
+  }
+
+  private handleSessionEnded(ws: WebSocket, generation: number): void {
+    if (!this.isCurrentSocket(ws, generation) || this.sessionEnded) return;
+
+    this.sessionEnded = true;
+    this.shouldNotReconnect = true;
+    this.awaitingAuthCredentials = false;
+    this.pendingReattach = false;
+    this.connectionGeneration += 1;
+    this.clearAllTimers();
+    this.setServerSessionId(null);
+    this.detachAndCloseSocket(ws, 1000, "Session ended");
+    this.config.onSessionEnded();
+  }
+
+  private detachSocketHandlers(ws: WebSocket): void {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+  }
+
+  private detachAndCloseSocket(
+    ws: WebSocket,
+    code?: number,
+    reason?: string,
+  ): void {
+    this.detachSocketHandlers(ws);
+    if (this.ws === ws) {
+      this.ws = null;
+    }
+
+    try {
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        ws.close(code, reason);
+      }
+    } catch (_) {}
+  }
+
+  private clearAllTimers(): void {
+    this.stopPingInterval();
+    this.clearReconnectTimeout();
+    this.clearPongTimeout();
+    this.clearConnectionTimeout();
   }
 
   private notifyFailureOnce(message: string): void {
