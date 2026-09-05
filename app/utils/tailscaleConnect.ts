@@ -1,5 +1,6 @@
 import * as SecureStore from "expo-secure-store";
 import {
+  cancelTermixTailscaleCurrentOperation,
   closeTermixTailscale,
   configureTermixTailscale,
   isTermixTailscaleAvailable,
@@ -12,9 +13,18 @@ import {
   type ForwardHandle,
 } from "@/modules/termix-tailscale";
 
+const LEGACY_ENABLED_STORE = "termix.tailscale.enabled";
 const AUTH_KEY_STORE = "termix.tailscale.authKey";
-const ENABLED_STORE = "termix.tailscale.enabled";
 const HOSTNAME_STORE = "termix.tailscale.hostname";
+
+const CONFIGURE_TIMEOUT_MS = 10_000;
+const UP_TIMEOUT_MS = 95_000;
+const START_FORWARD_TIMEOUT_MS = 15_000;
+const STATUS_TIMEOUT_MS = 5_000;
+const FORWARD_PROBE_TIMEOUT_MS = 8_000;
+const STOP_TIMEOUT_MS = 8_000;
+const CLOSE_TIMEOUT_MS = 6_000;
+const RECOVERY_TIMEOUT_MS = 125_000;
 
 export type ParsedServerUrl = {
   protocol: "http:" | "https:";
@@ -30,6 +40,8 @@ export type TailscaleTransportErrorCode =
   | "missing_auth_key"
   | "invalid_server"
   | "stale_operation"
+  | "operation_canceled"
+  | "operation_timeout"
   | "connect_failed";
 
 export class TailscaleTransportError extends Error {
@@ -49,23 +61,118 @@ export type TailscaleTransportResult = {
   rebuilt: boolean;
 };
 
+export type TailscaleLifecycleOptions = {
+  networkGeneration?: number;
+  signal?: AbortSignal;
+};
+
 type ActiveNodeConfig = {
   authKey: string;
   hostname: string;
   ephemeral: boolean;
+  networkGeneration: number;
 };
 
 let activeForward: ForwardHandle | null = null;
 let activeNodeConfig: ActiveNodeConfig | null = null;
 let tailscaleLifecycleQueue: Promise<void> = Promise.resolve();
 let lifecycleGeneration = 0;
+let currentNetworkGeneration = 0;
+let activeLifecycleController: AbortController | null = null;
 let recoveryFlight: {
   displayUrl: string;
+  networkGeneration: number;
   promise: Promise<TailscaleTransportResult>;
 } | null = null;
 
-function withTailscaleLifecycleLock<T>(
+function canceledError(message = "The Tailscale operation was canceled.") {
+  return new TailscaleTransportError("operation_canceled", message);
+}
+
+function timeoutError(label: string) {
+  return new TailscaleTransportError(
+    "operation_timeout",
+    `${label} took too long. The native operation was canceled; cleanup will continue in the background.`,
+  );
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw canceledError();
+}
+
+function withBoundedPromise<T>(
+  promise: Promise<T>,
+  options: {
+    label: string;
+    timeoutMs: number;
+    signal?: AbortSignal;
+    onInterrupt?: () => void;
+  },
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      options.signal?.removeEventListener("abort", handleAbort);
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const interrupt = (error: TailscaleTransportError) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        options.onInterrupt?.();
+      } finally {
+        reject(error);
+      }
+    };
+    const handleAbort = () => interrupt(canceledError());
+    const timeoutId = setTimeout(
+      () => interrupt(timeoutError(options.label)),
+      options.timeoutMs,
+    );
+
+    if (options.signal?.aborted) {
+      handleAbort();
+    } else {
+      options.signal?.addEventListener("abort", handleAbort, { once: true });
+      void promise.then(
+        (value) => finish(() => resolve(value)),
+        (error) => finish(() => reject(error)),
+      );
+    }
+  });
+}
+
+function runNativeStep<T>(
+  label: string,
+  timeoutMs: number,
+  signal: AbortSignal,
   operation: () => Promise<T>,
+): Promise<T> {
+  throwIfAborted(signal);
+  const promise = Promise.resolve().then(operation);
+  return withBoundedPromise(promise, {
+    label,
+    timeoutMs,
+    signal,
+    onInterrupt: cancelTermixTailscaleCurrentOperation,
+  });
+}
+
+function withTailscaleLifecycleLock<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: {
+    generation?: number;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    label?: string;
+  } = {},
 ): Promise<T> {
   const previous = tailscaleLifecycleQueue;
   let release!: () => void;
@@ -75,17 +182,73 @@ function withTailscaleLifecycleLock<T>(
 
   return previous
     .catch(() => undefined)
-    .then(operation)
+    .then(async () => {
+      if (options.generation !== undefined) {
+        assertCurrentGeneration(options.generation);
+      }
+      throwIfAborted(options.signal);
+
+      const controller = new AbortController();
+      const abortFromCaller = () => controller.abort();
+      options.signal?.addEventListener("abort", abortFromCaller, {
+        once: true,
+      });
+      if (options.signal?.aborted) controller.abort();
+      activeLifecycleController = controller;
+
+      const operationPromise = Promise.resolve().then(() =>
+        operation(controller.signal),
+      );
+      try {
+        return await withBoundedPromise(operationPromise, {
+          label: options.label ?? "Tailscale transport recovery",
+          timeoutMs: options.timeoutMs ?? RECOVERY_TIMEOUT_MS,
+          signal: controller.signal,
+          onInterrupt: () => {
+            controller.abort();
+            cancelTermixTailscaleCurrentOperation();
+          },
+        });
+      } finally {
+        options.signal?.removeEventListener("abort", abortFromCaller);
+        if (activeLifecycleController === controller) {
+          activeLifecycleController = null;
+        }
+      }
+    })
     .finally(() => release());
 }
 
-function assertCurrentGeneration(generation: number): void {
+function supersedeLifecycleOperation(): number {
+  lifecycleGeneration += 1;
+  if (activeLifecycleController) {
+    activeLifecycleController.abort();
+    cancelTermixTailscaleCurrentOperation();
+  }
+  return lifecycleGeneration;
+}
+
+function assertCurrentGeneration(
+  generation: number,
+  signal?: AbortSignal,
+): void {
+  throwIfAborted(signal);
   if (generation !== lifecycleGeneration) {
     throw new TailscaleTransportError(
       "stale_operation",
       "A newer Tailscale transport operation replaced this one.",
     );
   }
+}
+
+function resolveNetworkGeneration(networkGeneration?: number): number {
+  if (
+    networkGeneration !== undefined &&
+    networkGeneration > currentNetworkGeneration
+  ) {
+    currentNetworkGeneration = networkGeneration;
+  }
+  return networkGeneration ?? currentNetworkGeneration;
 }
 
 function asTransportError(error: unknown): TailscaleTransportError {
@@ -106,28 +269,28 @@ export function isTailscaleNativeAvailable(): boolean {
 }
 
 export async function loadTailscaleSettings(): Promise<{
+  /** @deprecated ServerConfig.viaTailscale is the selected-mode authority. */
   enabled: boolean;
   authKey: string;
   hostname: string;
 }> {
-  const [enabled, authKey, hostname] = await Promise.all([
-    SecureStore.getItemAsync(ENABLED_STORE),
+  const [authKey, hostname] = await Promise.all([
     SecureStore.getItemAsync(AUTH_KEY_STORE),
     SecureStore.getItemAsync(HOSTNAME_STORE),
   ]);
   return {
-    enabled: enabled === "1",
+    enabled: false,
     authKey: authKey ?? "",
     hostname: hostname ?? "termix-mobile",
   };
 }
 
 export async function saveTailscaleSettings(opts: {
-  enabled: boolean;
+  /** @deprecated Ignored; selected mode is persisted in ServerConfig. */
+  enabled?: boolean;
   authKey: string;
   hostname?: string;
 }): Promise<void> {
-  await SecureStore.setItemAsync(ENABLED_STORE, opts.enabled ? "1" : "0");
   if (opts.authKey) {
     await SecureStore.setItemAsync(AUTH_KEY_STORE, opts.authKey.trim());
   } else {
@@ -137,11 +300,12 @@ export async function saveTailscaleSettings(opts: {
     const h = opts.hostname.trim() || "termix-mobile";
     await SecureStore.setItemAsync(HOSTNAME_STORE, h);
   }
+  await SecureStore.deleteItemAsync(LEGACY_ENABLED_STORE);
 }
 
 export async function clearTailscaleSettings(): Promise<void> {
   await Promise.all([
-    SecureStore.deleteItemAsync(ENABLED_STORE),
+    SecureStore.deleteItemAsync(LEGACY_ENABLED_STORE),
     SecureStore.deleteItemAsync(AUTH_KEY_STORE),
     SecureStore.deleteItemAsync(HOSTNAME_STORE),
   ]);
@@ -216,17 +380,53 @@ function sameForwardTarget(
 
 async function getLiveTransportUrlUnsafe(
   displayUrl: string,
+  networkGeneration: number,
+  signal: AbortSignal,
 ): Promise<string | null> {
-  if (!activeForward || !activeNodeConfig) return null;
+  if (
+    !activeForward ||
+    !activeNodeConfig ||
+    activeNodeConfig.networkGeneration !== networkGeneration
+  ) {
+    return null;
+  }
 
   try {
     const parsed = parseServerUrl(displayUrl);
     if (!sameForwardTarget(activeForward, parsed)) return null;
-    if (!(await isTermixTailscaleUp())) return null;
-    if (!(await isTermixTailscaleForwardActive(activeForward))) return null;
-    if (!(await probeTermixTailscaleForward(activeForward))) return null;
+    if (
+      !(await runNativeStep(
+        "Checking Tailscale status",
+        STATUS_TIMEOUT_MS,
+        signal,
+        isTermixTailscaleUp,
+      ))
+    ) {
+      return null;
+    }
+    if (
+      !(await runNativeStep(
+        "Checking the Tailscale forward",
+        STATUS_TIMEOUT_MS,
+        signal,
+        () => isTermixTailscaleForwardActive(activeForward!),
+      ))
+    ) {
+      return null;
+    }
+    if (
+      !(await runNativeStep(
+        "Probing the Tailscale target",
+        FORWARD_PROBE_TIMEOUT_MS,
+        signal,
+        () => probeTermixTailscaleForward(activeForward!),
+      ))
+    ) {
+      return null;
+    }
     return transportUrlFor(activeForward, parsed.rest);
-  } catch {
+  } catch (error) {
+    if (signal.aborted || error instanceof TailscaleTransportError) throw error;
     return null;
   }
 }
@@ -234,9 +434,17 @@ async function getLiveTransportUrlUnsafe(
 /** A strongly validated localhost transport for the requested display URL. */
 export function getLiveTransportUrl(
   displayUrl: string,
+  options: TailscaleLifecycleOptions = {},
 ): Promise<string | null> {
-  return withTailscaleLifecycleLock(() =>
-    getLiveTransportUrlUnsafe(displayUrl),
+  const networkGeneration = resolveNetworkGeneration(options.networkGeneration);
+  return withTailscaleLifecycleLock(
+    (signal) =>
+      getLiveTransportUrlUnsafe(displayUrl, networkGeneration, signal),
+    {
+      signal: options.signal,
+      timeoutMs: 25_000,
+      label: "Tailscale health check",
+    },
   );
 }
 
@@ -244,23 +452,33 @@ export function getActiveTailscaleForward(): ForwardHandle | null {
   return activeForward;
 }
 
-type ConnectServerViaTailscaleOptions = {
+export type ConnectServerViaTailscaleOptions = TailscaleLifecycleOptions & {
   serverUrl: string;
   authKey: string;
   hostname?: string;
   ephemeral?: boolean;
 };
 
-async function shutdownTailscaleUnsafe(): Promise<void> {
+async function shutdownTailscaleUnsafe(signal: AbortSignal): Promise<void> {
   let stopError: unknown;
   try {
-    await stopAllTermixTailscaleForwards();
+    await runNativeStep(
+      "Stopping Tailscale forwards",
+      STOP_TIMEOUT_MS,
+      signal,
+      stopAllTermixTailscaleForwards,
+    );
   } catch (error) {
     stopError = error;
   }
 
   try {
-    await closeTermixTailscale();
+    await runNativeStep(
+      "Closing Tailscale",
+      CLOSE_TIMEOUT_MS,
+      signal,
+      closeTermixTailscale,
+    );
   } finally {
     activeForward = null;
     activeNodeConfig = null;
@@ -272,6 +490,8 @@ async function shutdownTailscaleUnsafe(): Promise<void> {
 async function connectServerViaTailscaleUnsafe(
   opts: ConnectServerViaTailscaleOptions,
   generation: number,
+  networkGeneration: number,
+  signal: AbortSignal,
 ): Promise<TailscaleTransportResult> {
   if (!isTermixTailscaleAvailable()) {
     throw new TailscaleTransportError(
@@ -293,37 +513,48 @@ async function connectServerViaTailscaleUnsafe(
     authKey,
     hostname: opts.hostname?.trim() || "termix-mobile",
     ephemeral: opts.ephemeral ?? true,
+    networkGeneration,
   };
   const configChanged =
     activeNodeConfig !== null &&
     (activeNodeConfig.authKey !== desiredConfig.authKey ||
       activeNodeConfig.hostname !== desiredConfig.hostname ||
-      activeNodeConfig.ephemeral !== desiredConfig.ephemeral);
+      activeNodeConfig.ephemeral !== desiredConfig.ephemeral ||
+      activeNodeConfig.networkGeneration !== desiredConfig.networkGeneration);
 
   if (configChanged) {
-    await shutdownTailscaleUnsafe();
-    assertCurrentGeneration(generation);
+    await shutdownTailscaleUnsafe(signal);
+    assertCurrentGeneration(generation, signal);
   }
 
-  let alreadyUp = await isTermixTailscaleUp();
-  assertCurrentGeneration(generation);
+  let alreadyUp = await runNativeStep(
+    "Checking Tailscale status",
+    STATUS_TIMEOUT_MS,
+    signal,
+    isTermixTailscaleUp,
+  );
+  assertCurrentGeneration(generation, signal);
 
   if (!alreadyUp && activeNodeConfig !== null) {
-    await shutdownTailscaleUnsafe();
-    assertCurrentGeneration(generation);
+    await shutdownTailscaleUnsafe(signal);
+    assertCurrentGeneration(generation, signal);
     alreadyUp = false;
   } else if (alreadyUp && activeNodeConfig === null) {
     // Native state can outlive a JS reload. Reconfigure rather than attaching a
     // forward to a node whose credentials/options cannot be identified.
-    await shutdownTailscaleUnsafe();
-    assertCurrentGeneration(generation);
+    await shutdownTailscaleUnsafe(signal);
+    assertCurrentGeneration(generation, signal);
     alreadyUp = false;
   }
 
   const live = activeNodeConfig
-    ? await getLiveTransportUrlUnsafe(parsed.original)
+    ? await getLiveTransportUrlUnsafe(
+        parsed.original,
+        networkGeneration,
+        signal,
+      )
     : null;
-  assertCurrentGeneration(generation);
+  assertCurrentGeneration(generation, signal);
   if (live && activeForward) {
     return {
       transportUrl: live,
@@ -334,27 +565,48 @@ async function connectServerViaTailscaleUnsafe(
   }
 
   if (!alreadyUp) {
-    await configureTermixTailscale(desiredConfig);
-    assertCurrentGeneration(generation);
-    await upTermixTailscale();
-    assertCurrentGeneration(generation);
+    await runNativeStep(
+      "Configuring Tailscale",
+      CONFIGURE_TIMEOUT_MS,
+      signal,
+      () => configureTermixTailscale(desiredConfig),
+    );
+    assertCurrentGeneration(generation, signal);
+    await runNativeStep(
+      "Connecting to Tailscale",
+      UP_TIMEOUT_MS,
+      signal,
+      upTermixTailscale,
+    );
+    assertCurrentGeneration(generation, signal);
     activeNodeConfig = desiredConfig;
   }
 
   try {
-    await stopAllTermixTailscaleForwards();
+    await runNativeStep(
+      "Replacing Tailscale forwards",
+      STOP_TIMEOUT_MS,
+      signal,
+      stopAllTermixTailscaleForwards,
+    );
   } finally {
     activeForward = null;
   }
-  assertCurrentGeneration(generation);
+  assertCurrentGeneration(generation, signal);
 
-  const forward = await startTermixTailscaleForward(
-    parsed.protocol,
-    parsed.host,
-    parsed.port,
+  const forward = await runNativeStep(
+    "Opening the Tailscale forward",
+    START_FORWARD_TIMEOUT_MS,
+    signal,
+    () =>
+      startTermixTailscaleForward(parsed.protocol, parsed.host, parsed.port),
   );
-  if (generation !== lifecycleGeneration) {
-    await stopAllTermixTailscaleForwards().catch(() => undefined);
+  if (
+    generation !== lifecycleGeneration ||
+    signal.aborted ||
+    networkGeneration !== currentNetworkGeneration
+  ) {
+    void stopAllTermixTailscaleForwards().catch(() => undefined);
     throw new TailscaleTransportError(
       "stale_operation",
       "A newer Tailscale transport operation replaced this one.",
@@ -374,89 +626,163 @@ async function connectServerViaTailscaleUnsafe(
 export function connectServerViaTailscale(
   opts: ConnectServerViaTailscaleOptions,
 ): Promise<TailscaleTransportResult> {
-  const generation = ++lifecycleGeneration;
-  return withTailscaleLifecycleLock(() =>
-    connectServerViaTailscaleUnsafe(opts, generation).catch((error) => {
-      throw asTransportError(error);
-    }),
+  const networkGeneration = resolveNetworkGeneration(opts.networkGeneration);
+  const generation = supersedeLifecycleOperation();
+  return withTailscaleLifecycleLock(
+    (signal) =>
+      connectServerViaTailscaleUnsafe(
+        opts,
+        generation,
+        networkGeneration,
+        signal,
+      ).catch((error) => {
+        throw asTransportError(error);
+      }),
+    {
+      generation,
+      signal: opts.signal,
+      timeoutMs: RECOVERY_TIMEOUT_MS,
+      label: "Tailscale connection",
+    },
   );
 }
 
 export function disconnectTailscaleForwards(): Promise<void> {
-  const generation = ++lifecycleGeneration;
-  return withTailscaleLifecycleLock(async () => {
-    try {
-      await stopAllTermixTailscaleForwards();
-      assertCurrentGeneration(generation);
-    } finally {
-      activeForward = null;
-    }
-  });
+  const generation = supersedeLifecycleOperation();
+  return withTailscaleLifecycleLock(
+    async (signal) => {
+      try {
+        await runNativeStep(
+          "Stopping Tailscale forwards",
+          STOP_TIMEOUT_MS,
+          signal,
+          stopAllTermixTailscaleForwards,
+        );
+        assertCurrentGeneration(generation, signal);
+      } finally {
+        activeForward = null;
+      }
+    },
+    { generation, timeoutMs: STOP_TIMEOUT_MS + 2_000 },
+  );
 }
 
 export function shutdownTailscale(): Promise<void> {
-  const generation = ++lifecycleGeneration;
-  return withTailscaleLifecycleLock(async () => {
-    await shutdownTailscaleUnsafe();
-    assertCurrentGeneration(generation);
-  });
+  const generation = supersedeLifecycleOperation();
+  cancelTermixTailscaleCurrentOperation();
+  return withTailscaleLifecycleLock(
+    async (signal) => {
+      await shutdownTailscaleUnsafe(signal);
+      assertCurrentGeneration(generation, signal);
+    },
+    {
+      generation,
+      timeoutMs: STOP_TIMEOUT_MS + CLOSE_TIMEOUT_MS + 2_000,
+      label: "Tailscale shutdown",
+    },
+  );
+}
+
+/** Cancel immediately and let bounded cleanup finish without blocking the caller. */
+export function shutdownTailscaleInBackground(): void {
+  void shutdownTailscale().catch(() => undefined);
+}
+
+/**
+ * Invalidate JS/native lifecycle work for a material native network generation.
+ * Late native promises may settle, but cannot republish stale JS state.
+ */
+export function invalidateTailscaleLifecycle(networkGeneration: number): void {
+  currentNetworkGeneration = networkGeneration;
+  lifecycleGeneration += 1;
+  recoveryFlight = null;
+  activeLifecycleController?.abort();
+  activeLifecycleController = null;
+  activeForward = null;
+  activeNodeConfig = null;
+  cancelTermixTailscaleCurrentOperation();
 }
 
 /**
  * Validate or rebuild the transport using the credentials stored in SecureStore.
- * Concurrent callers for the same display URL share one recovery flight.
+ * Concurrent callers share a flight only for the same URL and network generation.
  */
 export function recoverTailscaleTransport(
   displayUrl: string,
+  options: TailscaleLifecycleOptions = {},
 ): Promise<TailscaleTransportResult> {
   const parsed = parseServerUrl(displayUrl);
-  if (recoveryFlight?.displayUrl === parsed.original) {
+  const networkGeneration = resolveNetworkGeneration(options.networkGeneration);
+  if (
+    recoveryFlight?.displayUrl === parsed.original &&
+    recoveryFlight.networkGeneration === networkGeneration
+  ) {
     return recoveryFlight.promise;
   }
 
-  const generation = ++lifecycleGeneration;
-  const promise = withTailscaleLifecycleLock(async () => {
-    try {
-      const live = await getLiveTransportUrlUnsafe(parsed.original);
-      assertCurrentGeneration(generation);
-      if (live && activeForward) {
-        return {
-          transportUrl: live,
-          displayUrl: parsed.original,
-          forward: activeForward,
-          rebuilt: false,
-        };
-      }
-
-      const settings = await loadTailscaleSettings();
-      assertCurrentGeneration(generation);
-      if (!settings.authKey.trim()) {
-        throw new TailscaleTransportError(
-          "missing_auth_key",
-          "No saved Tailscale auth key is available.",
+  const generation = supersedeLifecycleOperation();
+  const promise = withTailscaleLifecycleLock(
+    async (signal) => {
+      try {
+        const live = await getLiveTransportUrlUnsafe(
+          parsed.original,
+          networkGeneration,
+          signal,
         );
+        assertCurrentGeneration(generation, signal);
+        if (live && activeForward) {
+          return {
+            transportUrl: live,
+            displayUrl: parsed.original,
+            forward: activeForward,
+            rebuilt: false,
+          };
+        }
+
+        const settings = await loadTailscaleSettings();
+        assertCurrentGeneration(generation, signal);
+        if (!settings.authKey.trim()) {
+          throw new TailscaleTransportError(
+            "missing_auth_key",
+            "No saved Tailscale auth key is available.",
+          );
+        }
+
+        // A failed strong health check is not reusable. Close all stale native
+        // state before rebuilding so an old listener cannot survive foregrounding.
+        await shutdownTailscaleUnsafe(signal).catch(() => undefined);
+        assertCurrentGeneration(generation, signal);
+
+        return await connectServerViaTailscaleUnsafe(
+          {
+            serverUrl: parsed.original,
+            authKey: settings.authKey,
+            hostname: settings.hostname,
+            ephemeral: true,
+            networkGeneration,
+            signal,
+          },
+          generation,
+          networkGeneration,
+          signal,
+        );
+      } catch (error) {
+        throw asTransportError(error);
       }
+    },
+    {
+      generation,
+      signal: options.signal,
+      timeoutMs: RECOVERY_TIMEOUT_MS,
+      label: "Tailscale transport recovery",
+    },
+  );
 
-      // A failed strong health check is not reusable. Close all stale native
-      // state before rebuilding so an old listener cannot survive foregrounding.
-      await shutdownTailscaleUnsafe().catch(() => undefined);
-      assertCurrentGeneration(generation);
-
-      return await connectServerViaTailscaleUnsafe(
-        {
-          serverUrl: parsed.original,
-          authKey: settings.authKey,
-          hostname: settings.hostname,
-          ephemeral: true,
-        },
-        generation,
-      );
-    } catch (error) {
-      throw asTransportError(error);
-    }
-  });
-
-  recoveryFlight = { displayUrl: parsed.original, promise };
+  recoveryFlight = {
+    displayUrl: parsed.original,
+    networkGeneration,
+    promise,
+  };
   const clearRecoveryFlight = () => {
     if (recoveryFlight?.promise === promise) recoveryFlight = null;
   };
@@ -467,10 +793,11 @@ export function recoverTailscaleTransport(
 /** Compatibility wrapper for callers that only need a nullable URL. */
 export async function rehydrateTailscaleTransport(
   displayUrl: string,
+  options: TailscaleLifecycleOptions = {},
 ): Promise<string | null> {
   if (!isTermixTailscaleAvailable()) return null;
   try {
-    return (await recoverTailscaleTransport(displayUrl)).transportUrl;
+    return (await recoverTailscaleTransport(displayUrl, options)).transportUrl;
   } catch {
     return null;
   }

@@ -441,6 +441,474 @@ function isLoopbackUrl(url: string): boolean {
   }
 }
 
+export type ServerTransportSessionState =
+  | "none"
+  | "authenticated"
+  | "unauthorized"
+  | "proxy-auth";
+
+export type ServerTransportHostsState =
+  | "healthy"
+  | "unauthorized"
+  | "not-checked"
+  | "unhealthy";
+
+export type ServerTransportAuthCapabilities = {
+  setupRequired?: boolean;
+  passwordLoginAllowed?: boolean;
+  registrationAllowed?: boolean;
+};
+
+export type ServerTransportHealth = {
+  ok: boolean;
+  runtimeUrl: string;
+  authBaseUrl: string | null;
+  hostBaseUrl: string;
+  statsBaseUrl: string | null;
+  sessionState: ServerTransportSessionState;
+  hostsState: ServerTransportHostsState;
+  authCapabilities: ServerTransportAuthCapabilities;
+  userInfo?: UserInfo;
+  error?: string;
+};
+
+export type ProbeServerTransportOptions = {
+  token?: string | null;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+type IsolatedProbeResponse = {
+  requestUrl: string;
+  responseUrl: string;
+  status: number | null;
+  json: unknown;
+  html: boolean;
+  proxyAuth: boolean;
+  networkError: boolean;
+};
+
+type PublicAuthProbe = {
+  baseUrl: string;
+  responses: Map<string, IsolatedProbeResponse>;
+  valid: boolean;
+  proxyAuth: boolean;
+  capabilities: ServerTransportAuthCapabilities;
+};
+
+const PUBLIC_AUTH_PROBES = [
+  "/users/setup-required",
+  "/users/password-login-allowed",
+  "/users/registration-allowed",
+] as const;
+
+function createAbortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function getTransportRouteCandidates(runtimeUrl: string): {
+  rootBaseUrl: string;
+  authBaseUrls: string[];
+  hostBaseUrl: string;
+  statsBaseUrls: string[];
+} {
+  const normalized = normalizeServerUrl(runtimeUrl);
+  const rootBaseUrl = normalized.replace(/\/ssh$/, "");
+  const sshBaseUrl = `${rootBaseUrl}/ssh`;
+  const authBaseUrls = normalized.endsWith("/ssh")
+    ? [sshBaseUrl, rootBaseUrl]
+    : [rootBaseUrl, sshBaseUrl];
+  return {
+    rootBaseUrl,
+    authBaseUrls,
+    hostBaseUrl: `${rootBaseUrl}/host`,
+    statsBaseUrls: authBaseUrls,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidPublicAuthResponse(path: string, value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (path.endsWith("/setup-required")) {
+    return typeof value.setup_required === "boolean";
+  }
+  return typeof value.allowed === "boolean";
+}
+
+function isValidUserInfo(value: unknown): value is UserInfo {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.username === "string" &&
+    value.username.trim().length > 0 &&
+    typeof value.userId === "string" &&
+    typeof value.is_admin === "boolean" &&
+    typeof value.data_unlocked === "boolean"
+  );
+}
+
+function isValidHostsResponse(value: unknown): value is SSHHost[] {
+  if (!Array.isArray(value)) return false;
+  return value.every((host) => {
+    if (!isRecord(host)) return false;
+    return (
+      (typeof host.id === "number" || typeof host.id === "string") &&
+      typeof host.name === "string" &&
+      typeof host.ip === "string"
+    );
+  });
+}
+
+function isSuccessfulProbe(response: IsolatedProbeResponse): boolean {
+  return (
+    response.status !== null && response.status >= 200 && response.status < 300
+  );
+}
+
+function isUsefulStatsResponse(value: unknown): boolean {
+  return isRecord(value) && Object.keys(value).length > 0;
+}
+
+function looksLikeProxyAuthHtml(
+  body: string,
+  status: number,
+  redirected: boolean,
+  responseUrl: string,
+): boolean {
+  const sample = body.slice(0, 64_000).toLowerCase();
+  if (status === 401 || status === 403 || status === 407) return true;
+  if (
+    /cloudflare access|authelia|authentik|pangolin|oauth|openid|single sign-on|\bsso\b/.test(
+      sample,
+    )
+  ) {
+    return true;
+  }
+  const hasLoginForm =
+    /<form[\s>]/.test(sample) &&
+    /password|sign[ -]?in|log[ -]?in|authenticate/.test(sample);
+  const redirectedToAuth =
+    redirected && /\/(?:login|auth|oauth|sso)(?:[/?#]|$)/i.test(responseUrl);
+  return hasLoginForm || redirectedToAuth;
+}
+
+async function isolatedTransportRequest(
+  url: string,
+  token: string | undefined,
+  signal: AbortSignal,
+): Promise<IsolatedProbeResponse> {
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal,
+      headers: {
+        Accept: "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        "User-Agent": `Termix-Mobile/${
+          Platform.OS === "android" ? "Android" : "iOS"
+        }`,
+      },
+    });
+    const contentType = (
+      response.headers.get("content-type") || ""
+    ).toLowerCase();
+    const body = await response.text();
+    const html =
+      contentType.includes("text/html") || /^\s*<(?:!doctype|html)/i.test(body);
+    let json: unknown = null;
+    if (!html && body.trim()) {
+      try {
+        json = JSON.parse(body);
+      } catch {
+        json = null;
+      }
+    }
+    return {
+      requestUrl: url,
+      responseUrl: response.url || url,
+      status: response.status,
+      json,
+      html,
+      proxyAuth:
+        html &&
+        looksLikeProxyAuthHtml(
+          body,
+          response.status,
+          response.redirected,
+          response.url || url,
+        ),
+      networkError: false,
+    };
+  } catch {
+    return {
+      requestUrl: url,
+      responseUrl: url,
+      status: null,
+      json: null,
+      html: false,
+      proxyAuth: false,
+      networkError: true,
+    };
+  }
+}
+
+async function probePublicAuthBase(
+  baseUrl: string,
+  token: string | undefined,
+  signal: AbortSignal,
+): Promise<PublicAuthProbe> {
+  const results = await Promise.all(
+    PUBLIC_AUTH_PROBES.map(async (path) => {
+      const response = await isolatedTransportRequest(
+        `${baseUrl}${path}`,
+        token,
+        signal,
+      );
+      return [path, response] as const;
+    }),
+  );
+  const responses = new Map(results);
+  const capabilities: ServerTransportAuthCapabilities = {};
+  const setup = responses.get("/users/setup-required")?.json;
+  const password = responses.get("/users/password-login-allowed")?.json;
+  const registration = responses.get("/users/registration-allowed")?.json;
+  if (isRecord(setup) && typeof setup.setup_required === "boolean") {
+    capabilities.setupRequired = setup.setup_required;
+  }
+  if (isRecord(password) && typeof password.allowed === "boolean") {
+    capabilities.passwordLoginAllowed = password.allowed;
+  }
+  if (isRecord(registration) && typeof registration.allowed === "boolean") {
+    capabilities.registrationAllowed = registration.allowed;
+  }
+  return {
+    baseUrl,
+    responses,
+    valid: results.some(
+      ([path, response]) =>
+        isSuccessfulProbe(response) &&
+        isValidPublicAuthResponse(path, response.json),
+    ),
+    proxyAuth: results.some(([, response]) => response.proxyAuth),
+    capabilities,
+  };
+}
+
+function applyTransportHealthRoutes(health: ServerTransportHealth): void {
+  if (health.authBaseUrl) {
+    latestServiceBaseURLs.set("AUTH", health.authBaseUrl);
+    authApi = createApiInstance(health.authBaseUrl, "AUTH");
+  }
+  latestServiceBaseURLs.set("SSH_HOST", health.hostBaseUrl);
+  sshHostApi = createApiInstance(health.hostBaseUrl, "SSH_HOST");
+  if (health.statsBaseUrl) {
+    latestServiceBaseURLs.set("STATS", health.statsBaseUrl);
+    statsApi = createApiInstance(health.statsBaseUrl, "STATS");
+  }
+}
+
+/**
+ * Validate a candidate transport without consulting the global request barrier or
+ * mutating any published Axios client. Generic HTML and arbitrary HTTP servers
+ * are rejected; a recognized reverse-proxy auth gate is reported separately.
+ */
+export async function probeServerTransport(
+  candidateRuntimeUrl: string,
+  options: ProbeServerTransportOptions = {},
+): Promise<ServerTransportHealth> {
+  const runtimeUrl = normalizeServerUrl(candidateRuntimeUrl);
+  const routes = getTransportRouteCandidates(runtimeUrl);
+  const token = options.token?.trim() || undefined;
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort();
+  options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, options.timeoutMs ?? 10_000);
+
+  try {
+    const [publicAuthProbes, userProbes, statsProbes] = await Promise.all([
+      Promise.all(
+        routes.authBaseUrls.map((baseUrl) =>
+          probePublicAuthBase(baseUrl, undefined, controller.signal),
+        ),
+      ),
+      token
+        ? Promise.all(
+            routes.authBaseUrls.map(async (baseUrl) => ({
+              baseUrl,
+              response: await isolatedTransportRequest(
+                `${baseUrl}/users/me`,
+                token,
+                controller.signal,
+              ),
+            })),
+          )
+        : Promise.resolve([]),
+      Promise.all(
+        routes.statsBaseUrls.map(async (baseUrl) => ({
+          baseUrl,
+          response: await isolatedTransportRequest(
+            `${baseUrl}/status`,
+            token,
+            controller.signal,
+          ),
+        })),
+      ),
+    ]);
+
+    if (controller.signal.aborted) {
+      throw createAbortError(
+        timedOut
+          ? "Server validation timed out."
+          : "Server validation was canceled.",
+      );
+    }
+
+    const publicAuth = publicAuthProbes.find((probe) => probe.valid);
+    const validUser = userProbes.find(
+      (probe) =>
+        isSuccessfulProbe(probe.response) &&
+        isValidUserInfo(probe.response.json),
+    );
+    const unauthorizedUser = userProbes.find(
+      (probe) =>
+        probe.response.status === 401 &&
+        publicAuthProbes.some(
+          (publicProbe) =>
+            publicProbe.baseUrl === probe.baseUrl && publicProbe.valid,
+        ),
+    );
+    const proxyAuth = publicAuthProbes.find((probe) => probe.proxyAuth);
+    const statsBaseUrl =
+      statsProbes.find(
+        (probe) =>
+          isSuccessfulProbe(probe.response) &&
+          isUsefulStatsResponse(probe.response.json),
+      )?.baseUrl ?? null;
+    const authBaseUrl =
+      validUser?.baseUrl ??
+      unauthorizedUser?.baseUrl ??
+      publicAuth?.baseUrl ??
+      null;
+    const capabilities =
+      publicAuthProbes.find((probe) => probe.baseUrl === authBaseUrl)
+        ?.capabilities ?? {};
+
+    const baseHealth = {
+      runtimeUrl,
+      authBaseUrl,
+      hostBaseUrl: routes.hostBaseUrl,
+      statsBaseUrl,
+      authCapabilities: capabilities,
+    };
+
+    if (token && validUser) {
+      const hostsResponse = await isolatedTransportRequest(
+        `${routes.hostBaseUrl}/db/host`,
+        token,
+        controller.signal,
+      );
+      if (controller.signal.aborted) {
+        throw createAbortError(
+          timedOut
+            ? "Server validation timed out."
+            : "Server validation was canceled.",
+        );
+      }
+      if (hostsResponse.status === 401) {
+        return {
+          ...baseHealth,
+          ok: true,
+          sessionState: "unauthorized",
+          hostsState: "unauthorized",
+          error: "The saved login session has expired.",
+        };
+      }
+      if (
+        !isSuccessfulProbe(hostsResponse) ||
+        !isValidHostsResponse(hostsResponse.json)
+      ) {
+        return {
+          ...baseHealth,
+          ok: false,
+          sessionState: "authenticated",
+          hostsState: "unhealthy",
+          userInfo: validUser.response.json as UserInfo,
+          error:
+            "The Termix authentication service responded, but the Hosts route is unavailable.",
+        };
+      }
+      return {
+        ...baseHealth,
+        ok: true,
+        sessionState: "authenticated",
+        hostsState: "healthy",
+        userInfo: validUser.response.json as UserInfo,
+      };
+    }
+
+    if (token && unauthorizedUser) {
+      return {
+        ...baseHealth,
+        ok: true,
+        sessionState: "unauthorized",
+        hostsState: "not-checked",
+        error: "The saved login session has expired.",
+      };
+    }
+
+    if (publicAuth && !token) {
+      return {
+        ...baseHealth,
+        ok: true,
+        sessionState: "none",
+        hostsState: "not-checked",
+      };
+    }
+
+    if (publicAuth && token) {
+      return {
+        ...baseHealth,
+        ok: false,
+        sessionState: "none",
+        hostsState: "unhealthy",
+        error:
+          "The server is reachable, but the saved login session could not be validated. The token was not removed.",
+      };
+    }
+
+    if (proxyAuth) {
+      return {
+        ...baseHealth,
+        ok: true,
+        authBaseUrl: proxyAuth.baseUrl,
+        sessionState: "proxy-auth",
+        hostsState: "not-checked",
+      };
+    }
+
+    return {
+      ...baseHealth,
+      ok: false,
+      sessionState: "none",
+      hostsState: "unhealthy",
+      error:
+        "No compatible Termix API was found at this address. Check the server URL and network connection.",
+    };
+  } finally {
+    clearTimeout(timeoutId);
+    options.signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
 export type InitializeServerConfigOptions = {
   /**
    * When true (default), try to keep/restore a Tailscale localhost forward if
@@ -541,12 +1009,22 @@ export async function initializeServerConfig(
  * Apply transport for the session: direct display URL, or Tailscale forward.
  * Persists displayUrl + viaTailscale preference without requiring re-entry.
  */
+export type ApplyServerTransportOptions = ProbeServerTransportOptions & {
+  networkSignature?: string;
+  networkGeneration?: number;
+};
+
 export type ApplyServerTransportResult =
-  | { ok: true; runtimeUrl: string }
-  | { ok: false; error: string };
+  | {
+      ok: true;
+      runtimeUrl: string;
+      health: ServerTransportHealth;
+    }
+  | { ok: false; error: string; health?: ServerTransportHealth };
 
 export async function applyServerTransportMode(
   mode: "direct" | "tailscale",
+  options: ApplyServerTransportOptions = {},
 ): Promise<ApplyServerTransportResult> {
   const displayUrl =
     configuredServerMeta?.displayUrl ||
@@ -566,53 +1044,81 @@ export async function applyServerTransportMode(
   }
 
   try {
-    if (mode === "direct") {
-      const { shutdownTailscale } = await import("./utils/tailscaleConnect");
-      try {
-        await shutdownTailscale();
-      } catch {
-        // A stale native node must not prevent an explicit Direct/LAN choice.
-      }
-      configuredServerUrl = origin;
-      configuredServerMeta = {
-        serverUrl: origin,
-        displayUrl: origin,
-        viaTailscale: false,
-        lastUpdated: new Date().toISOString(),
-      };
-      await AsyncStorage.setItem(
-        "serverConfig",
-        JSON.stringify(configuredServerMeta),
-      );
-      updateApiInstances();
-      await detectAndUpdateApiInstances();
-      return { ok: true, runtimeUrl: origin };
+    if (options.signal?.aborted) {
+      throw createAbortError("Server transport selection was canceled.");
     }
 
-    const { recoverTailscaleTransport } =
-      await import("./utils/tailscaleConnect");
-    const recovered = await recoverTailscaleTransport(origin);
+    const token =
+      options.token === undefined
+        ? await getCookie("jwt")
+        : options.token?.trim() || undefined;
+    let runtimeUrl = origin;
+    let shutdownTailscaleInBackground: (() => void) | null = null;
 
-    // Disk keeps the real origin and selected mode; memory uses localhost.
-    configuredServerMeta = {
+    if (mode === "tailscale") {
+      const { recoverTailscaleTransport } =
+        await import("./utils/tailscaleConnect");
+      const recovered = await recoverTailscaleTransport(origin, {
+        networkGeneration: options.networkGeneration,
+        signal: options.signal,
+      });
+      runtimeUrl = normalizeServerUrl(recovered.transportUrl);
+    } else {
+      ({ shutdownTailscaleInBackground } =
+        await import("./utils/tailscaleConnect"));
+    }
+
+    const health = await probeServerTransport(runtimeUrl, {
+      token,
+      signal: options.signal,
+      timeoutMs: options.timeoutMs,
+    });
+    if (!health.ok) {
+      return {
+        ok: false,
+        error:
+          health.error ||
+          "The selected connection mode could not reach a compatible Termix server.",
+        health,
+      };
+    }
+    if (options.signal?.aborted) {
+      throw createAbortError("Server transport selection was canceled.");
+    }
+
+    const networkSignature = options.networkSignature?.trim();
+    const nextMeta: ServerConfig = {
+      ...(configuredServerMeta ?? {
+        serverUrl: origin,
+        lastUpdated: new Date().toISOString(),
+      }),
       serverUrl: origin,
       displayUrl: origin,
-      viaTailscale: true,
+      viaTailscale: mode === "tailscale",
       lastUpdated: new Date().toISOString(),
+      ...(networkSignature ? { lastNetworkSignature: networkSignature } : {}),
     };
-    await AsyncStorage.setItem(
-      "serverConfig",
-      JSON.stringify(configuredServerMeta),
-    );
-    configuredServerUrl = normalizeServerUrl(recovered.transportUrl);
+
+    // Persist metadata before publication so no request can observe a mode that
+    // would disappear after process restart. Candidate probing above is isolated.
+    await AsyncStorage.setItem("serverConfig", JSON.stringify(nextMeta));
+    if (options.signal?.aborted) {
+      throw createAbortError("Server transport selection was canceled.");
+    }
+
+    configuredServerMeta = nextMeta;
+    configuredServerUrl = runtimeUrl;
     updateApiInstances();
-    await detectAndUpdateApiInstances();
-    return { ok: true, runtimeUrl: configuredServerUrl };
+    applyTransportHealthRoutes(health);
+
+    shutdownTailscaleInBackground?.();
+
+    return { ok: true, runtimeUrl, health };
   } catch (error) {
     const message =
       error instanceof Error && error.message.trim()
         ? error.message
-        : "Unable to establish the Tailscale transport.";
+        : "Unable to establish the selected server transport.";
     systemLogger.warn("[applyServerTransportMode] failed", {
       operation: "apply_server_transport_mode",
       error: message,
@@ -657,8 +1163,8 @@ export async function setRuntimeTransportUrl(
   }
 }
 
-export async function detectServerRoutes(): Promise<void> {
-  await detectAndUpdateApiInstances();
+export async function detectServerRoutes(): Promise<ServerTransportHealth> {
+  return detectAndUpdateApiInstances();
 }
 
 /**
@@ -727,8 +1233,9 @@ export async function clearServerConfig(): Promise<void> {
     releaseServerTransportRequests();
     updateApiInstances();
     try {
-      const { shutdownTailscale } = await import("./utils/tailscaleConnect");
-      await shutdownTailscale();
+      const { shutdownTailscaleInBackground } =
+        await import("./utils/tailscaleConnect");
+      shutdownTailscaleInBackground();
     } catch {
       // optional native module
     }
@@ -840,63 +1347,54 @@ function initializeApiInstances() {
   authApi = createApiInstance(authBase, "AUTH");
 }
 
-async function detectAndUpdateApiInstances(): Promise<void> {
+async function detectAndUpdateApiInstances(): Promise<ServerTransportHealth> {
   const detectionGeneration = apiConfigGeneration;
   const detectionTransportUrl = configuredServerUrl;
-  const statsRootBase = getRootBase(8085).replace(/\/$/, "");
-  const statsSshBase = getSshBase(8085).replace(/\/$/, "");
-  const authRootBase = getRootBase(8081).replace(/\/$/, "");
-  const authSshBase = getSshBase(8081).replace(/\/$/, "");
+  if (!detectionTransportUrl) {
+    return {
+      ok: false,
+      runtimeUrl: "",
+      authBaseUrl: null,
+      hostBaseUrl: "",
+      statsBaseUrl: null,
+      sessionState: "none",
+      hostsState: "unhealthy",
+      authCapabilities: {},
+      error: "No server transport is configured.",
+    };
+  }
 
   try {
     const token = await getCookie("jwt");
-    const authHeaders = {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    };
-    const probe = async (baseURL: string, path: string) => {
-      try {
-        await axios
-          .create({ baseURL, timeout: 5000, headers: authHeaders })
-          .head(path);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-
-    const [statsRootOk, statsSshOk, authRootOk, authSshOk] = await Promise.all([
-      probe(statsRootBase, "/status"),
-      probe(statsSshBase, "/status"),
-      probe(authRootBase, "/users/registration-allowed"),
-      probe(authSshBase, "/users/registration-allowed"),
-    ]);
-
+    const health = await probeServerTransport(detectionTransportUrl, { token });
     if (
       detectionGeneration !== apiConfigGeneration ||
       detectionTransportUrl !== configuredServerUrl
     ) {
-      return;
+      return {
+        ...health,
+        ok: false,
+        error: "Server transport changed while route detection was running.",
+      };
     }
-
-    if (statsRootOk) {
-      latestServiceBaseURLs.set("STATS", statsRootBase);
-      statsApi = createApiInstance(statsRootBase, "STATS");
-    } else if (statsSshOk) {
-      latestServiceBaseURLs.set("STATS", statsSshBase);
-      statsApi = createApiInstance(statsSshBase, "STATS");
-    }
-
-    if (authRootOk) {
-      latestServiceBaseURLs.set("AUTH", authRootBase);
-      authApi = createApiInstance(authRootBase, "AUTH");
-    } else if (authSshOk) {
-      latestServiceBaseURLs.set("AUTH", authSshBase);
-      authApi = createApiInstance(authSshBase, "AUTH");
-    }
-  } catch {
-    // Route detection is advisory. The default clients already target the
-    // committed transport and remain valid when probes are unavailable.
+    if (health.ok) applyTransportHealthRoutes(health);
+    return health;
+  } catch (error) {
+    const routes = getTransportRouteCandidates(detectionTransportUrl);
+    return {
+      ok: false,
+      runtimeUrl: detectionTransportUrl,
+      authBaseUrl: null,
+      hostBaseUrl: routes.hostBaseUrl,
+      statsBaseUrl: null,
+      sessionState: "none",
+      hostsState: "unhealthy",
+      authCapabilities: {},
+      error:
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : "Unable to detect Termix server routes.",
+    };
   }
 }
 

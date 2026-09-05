@@ -1037,6 +1037,8 @@ export interface ServerConfig {
   displayUrl?: string;
   /** Whether the active transport is a userspace Tailscale local forward. */
   viaTailscale?: boolean;
+  /** Material native network signature where this mode last validated. */
+  lastNetworkSignature?: string;
 }
 
 // ============================================================================
