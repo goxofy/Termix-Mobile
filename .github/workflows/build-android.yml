@@ -13,13 +13,10 @@ on:
           - apple
           - android
       code_branch:
-        type: choice
-        description: Code branch to build
-        default: "worktree-tailscale-dev-https"
+        type: string
+        description: Branch, tag, or commit SHA to build
+        default: "main"
         required: true
-        options:
-          - worktree-tailscale-dev-https
-          - main
 
 permissions:
   contents: read
