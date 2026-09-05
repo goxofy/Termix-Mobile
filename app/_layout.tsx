@@ -25,40 +25,77 @@ import UpdateRequired from "@/app/authentication/UpdateRequired";
 function RootLayoutContent() {
   const {
     authFlowVisible,
-    openAuthFlow,
     showUpdateScreen,
     isLoading,
-    setIsLoading,
     transportState,
+    transportError,
+    retryTransport,
+    cancelTransportRecovery,
+    changeServer,
   } = useAppContext();
   const accent = useThemeColor()("accent-brand");
 
-  if (isLoading) {
+  if ((isLoading || transportState !== "ready") && authFlowVisible) {
+    return <AuthFlow />;
+  }
+
+  if (isLoading || transportState !== "ready") {
+    const failed = transportState === "failed";
     return (
-      <View className="flex-1 items-center justify-center bg-background">
-        <ActivityIndicator size="large" color={accent} />
+      <View className="flex-1 items-center justify-center bg-background px-8">
+        {!failed ? <ActivityIndicator size="large" color={accent} /> : null}
         <Text
-          className="mt-4 text-base text-foreground"
+          className={`${failed ? "" : "mt-4"} text-center text-base text-foreground`}
           style={{ fontFamily: MONO_FONT }}
         >
-          Initializing…
+          {failed ? "Connection unavailable" : "Initializing…"}
         </Text>
-        {transportState === "ready" ? (
+        {transportError ? (
+          <Text
+            className="mt-3 max-w-md text-center text-xs leading-5 text-muted-foreground"
+            style={{ fontFamily: MONO_FONT }}
+          >
+            {transportError}
+          </Text>
+        ) : null}
+        <View className="mt-6 w-full max-w-xs gap-2.5">
+          {failed ? (
+            <TouchableOpacity
+              onPress={retryTransport}
+              className="items-center border border-accent-brand/40 bg-accent-brand/10 px-6 py-3"
+            >
+              <Text
+                className="text-accent-brand"
+                style={{ fontFamily: MONO_FONT_BOLD }}
+              >
+                Retry
+              </Text>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              onPress={cancelTransportRecovery}
+              className="items-center border border-border bg-card px-6 py-3"
+            >
+              <Text
+                className="text-foreground"
+                style={{ fontFamily: MONO_FONT_BOLD }}
+              >
+                Cancel attempt
+              </Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity
-            onPress={() => {
-              setIsLoading(false);
-              openAuthFlow("server");
-            }}
-            className="mt-6 border border-border bg-card px-6 py-3"
+            onPress={changeServer}
+            className="items-center border border-border bg-card px-6 py-3"
           >
             <Text
               className="text-foreground"
               style={{ fontFamily: MONO_FONT_BOLD }}
             >
-              Cancel
+              Change server
             </Text>
           </TouchableOpacity>
-        ) : null}
+        </View>
       </View>
     );
   }

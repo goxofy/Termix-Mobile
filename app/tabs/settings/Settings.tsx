@@ -55,8 +55,13 @@ export default function Settings() {
   const router = useRouter();
   const color = useThemeColor();
   const appVersion = Constants.expoConfig?.version ?? "";
-  const { isAuthenticated, setAuthenticated, openAuthFlow, authFlowVisible } =
-    useAppContext();
+  const {
+    isAuthenticated,
+    setAuthenticated,
+    openAuthFlow,
+    authFlowVisible,
+    changeServer,
+  } = useAppContext();
   const { clearAllSessions } = useTerminalSessions();
   const { theme, setTheme, accent, setAccent } = useTheme();
   const appLock = useAppLock();
@@ -129,18 +134,13 @@ export default function Settings() {
     // re-authenticates from there or from this Server section.
   };
 
-  const handleChangeServer = async () => {
-    // Mirror sign-out: invalidate the server-side session too (not just the
-    // local JWT), otherwise the still-valid Termix cookie in the browser/WebView
-    // lets the next OIDC resume the old account.
-    try {
-      await logoutUser();
-    } catch {
-      // best-effort — session may already be gone
-    }
-    await clearSession();
+  const handleChangeServer = () => {
+    // Leave the loading/transport surface immediately. The server-side logout is
+    // best-effort and must not hold the AuthFlow hostage behind a dead network.
+    setAuthenticated(false);
     clearCachedUserId();
-    openAuthFlow("server");
+    void logoutUser().catch(() => undefined);
+    changeServer();
   };
 
   const handleAppLockToggle = (v: boolean) => {
@@ -227,7 +227,9 @@ export default function Settings() {
               {viaTailscale ? (
                 <Text className="text-[10px] text-muted-foreground">
                   Transport: localhost forward
-                  {isTailscaleNativeAvailable() ? "" : " (native module missing)"}
+                  {isTailscaleNativeAvailable()
+                    ? ""
+                    : " (native module missing)"}
                 </Text>
               ) : null}
             </View>
@@ -300,7 +302,9 @@ export default function Settings() {
 
               <View className="mt-1 gap-0">
                 <Pressable
-                  onPress={() => router.push("/tabs/settings/TwoFactorAuth" as any)}
+                  onPress={() =>
+                    router.push("/tabs/settings/TwoFactorAuth" as any)
+                  }
                   className="flex-row items-center justify-between border-t border-border py-3"
                 >
                   <View className="flex-row items-center gap-2">
@@ -313,7 +317,9 @@ export default function Settings() {
                 </Pressable>
                 {isAdmin ? (
                   <Pressable
-                    onPress={() => router.push("/tabs/settings/ActiveSessions" as any)}
+                    onPress={() =>
+                      router.push("/tabs/settings/ActiveSessions" as any)
+                    }
                     className="flex-row items-center justify-between border-t border-border py-3"
                   >
                     <View className="flex-row items-center gap-2">

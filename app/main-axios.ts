@@ -304,6 +304,8 @@ let configuredServerUrl: string | null = null;
 /** Full last-saved config (includes displayUrl / viaTailscale when set). */
 let configuredServerMeta: ServerConfig | null = null;
 let apiConfigGeneration = 0;
+let transportApplicationGeneration = 0;
+let transportCommitQueue: Promise<void> = Promise.resolve();
 
 type TransportBarrierState = {
   promise: Promise<void>;
@@ -547,7 +549,8 @@ function isValidUserInfo(value: unknown): value is UserInfo {
     value.username.trim().length > 0 &&
     typeof value.userId === "string" &&
     typeof value.is_admin === "boolean" &&
-    typeof value.data_unlocked === "boolean"
+    (value.data_unlocked === undefined ||
+      typeof value.data_unlocked === "boolean")
   );
 }
 
@@ -569,8 +572,34 @@ function isSuccessfulProbe(response: IsolatedProbeResponse): boolean {
   );
 }
 
+function isAuthoritativeTermixUnauthorized(
+  response: IsolatedProbeResponse,
+): boolean {
+  if (
+    response.status !== 401 ||
+    response.html ||
+    response.proxyAuth ||
+    !isRecord(response.json)
+  ) {
+    return false;
+  }
+  const evidence = [
+    response.json.code,
+    response.json.error,
+    response.json.message,
+    response.json.detail,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  return /auth|bearer|credential|jwt|login|session|token|unauthori[sz]ed|expired/.test(
+    evidence,
+  );
+}
+
 function isUsefulStatsResponse(value: unknown): boolean {
-  return isRecord(value) && Object.keys(value).length > 0;
+  // A server with zero accessible hosts legitimately returns an empty status map.
+  return isRecord(value);
 }
 
 function looksLikeProxyAuthHtml(
@@ -580,20 +609,22 @@ function looksLikeProxyAuthHtml(
   responseUrl: string,
 ): boolean {
   const sample = body.slice(0, 64_000).toLowerCase();
-  if (status === 401 || status === 403 || status === 407) return true;
-  if (
-    /cloudflare access|authelia|authentik|pangolin|oauth|openid|single sign-on|\bsso\b/.test(
-      sample,
-    )
-  ) {
-    return true;
-  }
+  const hasKnownProxyMarker =
+    /cloudflare access|authelia|authentik|pangolin/.test(sample);
   const hasLoginForm =
     /<form[\s>]/.test(sample) &&
     /password|sign[ -]?in|log[ -]?in|authenticate/.test(sample);
   const redirectedToAuth =
     redirected && /\/(?:login|auth|oauth|sso)(?:[/?#]|$)/i.test(responseUrl);
-  return hasLoginForm || redirectedToAuth;
+  const hasExplicitAuthPage =
+    (status === 401 || status === 403 || status === 407) &&
+    /sign[ -]?in|log[ -]?in|authenticate/.test(sample);
+  return (
+    hasKnownProxyMarker ||
+    hasLoginForm ||
+    redirectedToAuth ||
+    hasExplicitAuthPage
+  );
 }
 
 async function isolatedTransportRequest(
@@ -627,9 +658,10 @@ async function isolatedTransportRequest(
         json = null;
       }
     }
+    const responseUrl = response.url || url;
     return {
       requestUrl: url,
-      responseUrl: response.url || url,
+      responseUrl,
       status: response.status,
       json,
       html,
@@ -638,8 +670,8 @@ async function isolatedTransportRequest(
         looksLikeProxyAuthHtml(
           body,
           response.status,
-          response.redirected,
-          response.url || url,
+          responseUrl !== url,
+          responseUrl,
         ),
       networkError: false,
     };
@@ -778,13 +810,8 @@ export async function probeServerTransport(
         isSuccessfulProbe(probe.response) &&
         isValidUserInfo(probe.response.json),
     );
-    const unauthorizedUser = userProbes.find(
-      (probe) =>
-        probe.response.status === 401 &&
-        publicAuthProbes.some(
-          (publicProbe) =>
-            publicProbe.baseUrl === probe.baseUrl && publicProbe.valid,
-        ),
+    const unauthorizedUser = userProbes.find((probe) =>
+      isAuthoritativeTermixUnauthorized(probe.response),
     );
     const proxyAuth = publicAuthProbes.find((probe) => probe.proxyAuth);
     const statsBaseUrl =
@@ -823,7 +850,7 @@ export async function probeServerTransport(
             : "Server validation was canceled.",
         );
       }
-      if (hostsResponse.status === 401) {
+      if (isAuthoritativeTermixUnauthorized(hostsResponse)) {
         return {
           ...baseHealth,
           ok: true,
@@ -1010,6 +1037,8 @@ export async function initializeServerConfig(
  * Persists displayUrl + viaTailscale preference without requiring re-entry.
  */
 export type ApplyServerTransportOptions = ProbeServerTransportOptions & {
+  /** User-facing origin to stage without publishing it before validation. */
+  displayUrl?: string;
   networkSignature?: string;
   networkGeneration?: number;
 };
@@ -1022,11 +1051,67 @@ export type ApplyServerTransportResult =
     }
   | { ok: false; error: string; health?: ServerTransportHealth };
 
+async function commitServerTransportCandidate(
+  applicationGeneration: number,
+  nextMeta: ServerConfig,
+  runtimeUrl: string,
+  health: ServerTransportHealth,
+  signal?: AbortSignal,
+): Promise<void> {
+  const previousCommit = transportCommitQueue;
+  let releaseCommit!: () => void;
+  transportCommitQueue = new Promise<void>((resolve) => {
+    releaseCommit = resolve;
+  });
+
+  await previousCommit.catch(() => undefined);
+  try {
+    if (
+      signal?.aborted ||
+      applicationGeneration !== transportApplicationGeneration
+    ) {
+      throw createAbortError("Server transport selection was superseded.");
+    }
+
+    const previousPersistedConfig = await AsyncStorage.getItem("serverConfig");
+    if (
+      signal?.aborted ||
+      applicationGeneration !== transportApplicationGeneration
+    ) {
+      throw createAbortError("Server transport selection was superseded.");
+    }
+
+    await AsyncStorage.setItem("serverConfig", JSON.stringify(nextMeta));
+    if (
+      signal?.aborted ||
+      applicationGeneration !== transportApplicationGeneration
+    ) {
+      // AsyncStorage writes cannot be canceled. Restore the previously published
+      // metadata before allowing a newer validated candidate to enter the queue.
+      if (previousPersistedConfig === null) {
+        await AsyncStorage.removeItem("serverConfig");
+      } else {
+        await AsyncStorage.setItem("serverConfig", previousPersistedConfig);
+      }
+      throw createAbortError("Server transport selection was superseded.");
+    }
+
+    configuredServerMeta = nextMeta;
+    configuredServerUrl = runtimeUrl;
+    updateApiInstances();
+    applyTransportHealthRoutes(health);
+  } finally {
+    releaseCommit();
+  }
+}
+
 export async function applyServerTransportMode(
   mode: "direct" | "tailscale",
   options: ApplyServerTransportOptions = {},
 ): Promise<ApplyServerTransportResult> {
+  const applicationGeneration = ++transportApplicationGeneration;
   const displayUrl =
+    options.displayUrl ||
     configuredServerMeta?.displayUrl ||
     configuredServerMeta?.serverUrl ||
     configuredServerUrl;
@@ -1043,6 +1128,7 @@ export async function applyServerTransportMode(
     };
   }
 
+  let shutdownTailscaleInBackground: (() => void) | null = null;
   try {
     if (options.signal?.aborted) {
       throw createAbortError("Server transport selection was canceled.");
@@ -1053,12 +1139,11 @@ export async function applyServerTransportMode(
         ? await getCookie("jwt")
         : options.token?.trim() || undefined;
     let runtimeUrl = origin;
-    let shutdownTailscaleInBackground: (() => void) | null = null;
 
     if (mode === "tailscale") {
-      const { recoverTailscaleTransport } =
-        await import("./utils/tailscaleConnect");
-      const recovered = await recoverTailscaleTransport(origin, {
+      const tailscale = await import("./utils/tailscaleConnect");
+      shutdownTailscaleInBackground = tailscale.shutdownTailscaleInBackground;
+      const recovered = await tailscale.recoverTailscaleTransport(origin, {
         networkGeneration: options.networkGeneration,
         signal: options.signal,
       });
@@ -1074,6 +1159,18 @@ export async function applyServerTransportMode(
       timeoutMs: options.timeoutMs,
     });
     if (!health.ok) {
+      if (
+        mode === "tailscale" &&
+        applicationGeneration === transportApplicationGeneration
+      ) {
+        // Recovery may have replaced an unhealthy/stale localhost forward before
+        // the HTTP semantic probe ran. Do not leave Axios pointing at that stopped
+        // old port, and do not leave the uncommitted candidate running. Persisted
+        // display/viaTailscale metadata remains untouched; Retry will rebuild it.
+        shutdownTailscaleInBackground?.();
+        configuredServerUrl = origin;
+        updateApiInstances();
+      }
       return {
         ok: false,
         error:
@@ -1099,22 +1196,34 @@ export async function applyServerTransportMode(
       ...(networkSignature ? { lastNetworkSignature: networkSignature } : {}),
     };
 
-    // Persist metadata before publication so no request can observe a mode that
-    // would disappear after process restart. Candidate probing above is isolated.
-    await AsyncStorage.setItem("serverConfig", JSON.stringify(nextMeta));
-    if (options.signal?.aborted) {
-      throw createAbortError("Server transport selection was canceled.");
+    // Candidate probes run in parallel, but validated commits are serialized. If
+    // an AsyncStorage write is superseded mid-flight, the commit gate restores the
+    // prior metadata before a newer candidate may publish.
+    await commitServerTransportCandidate(
+      applicationGeneration,
+      nextMeta,
+      runtimeUrl,
+      health,
+      options.signal,
+    );
+
+    if (mode === "direct") {
+      shutdownTailscaleInBackground?.();
     }
-
-    configuredServerMeta = nextMeta;
-    configuredServerUrl = runtimeUrl;
-    updateApiInstances();
-    applyTransportHealthRoutes(health);
-
-    shutdownTailscaleInBackground?.();
 
     return { ok: true, runtimeUrl, health };
   } catch (error) {
+    if (
+      mode === "tailscale" &&
+      applicationGeneration === transportApplicationGeneration
+    ) {
+      // Abort/deadline can happen after a candidate forward was opened but before
+      // its semantic result returned. Cleanup is conditional so a newer transport
+      // application cannot have its candidate canceled by this stale operation.
+      shutdownTailscaleInBackground?.();
+      configuredServerUrl = origin;
+      updateApiInstances();
+    }
     const message =
       error instanceof Error && error.message.trim()
         ? error.message
@@ -1225,7 +1334,11 @@ export async function clearAuth(): Promise<void> {
 }
 
 export async function clearServerConfig(): Promise<void> {
+  // Prevent a validated candidate that is still in flight from republishing a
+  // server after the user explicitly cleared configuration.
+  transportApplicationGeneration += 1;
   try {
+    await transportCommitQueue.catch(() => undefined);
     await AsyncStorage.removeItem("serverConfig");
     await AsyncStorage.removeItem("server");
     configuredServerUrl = null;

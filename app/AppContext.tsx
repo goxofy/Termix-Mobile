@@ -1,43 +1,49 @@
 import React, {
   createContext,
+  useCallback,
   useContext,
-  useState,
-  ReactNode,
   useEffect,
   useRef,
-  useCallback,
+  useState,
+  type ReactNode,
 } from "react";
-import { AppState, AppStateStatus } from "react-native";
+import { AppState, type AppStateStatus } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import Constants from "expo-constants";
+import {
+  addTermixTailscaleNetworkChangeListener,
+  cancelTermixTailscaleCurrentOperation,
+  getTermixTailscaleNetworkSnapshot,
+  type NetworkSnapshot,
+} from "@/modules/termix-tailscale";
 import {
   applyServerTransportMode,
   blockServerTransportRequests,
   clearAuth,
-  detectServerRoutes,
+  clearSession,
   failServerTransportRequests,
   getCurrentServerUrl,
   getDisplayServerUrl,
   getLatestGitHubRelease,
   getServerConfigMeta,
-  getUserInfo,
   getVersionInfo,
   initializeServerConfig,
-  isUnauthorizedError,
+  probeServerTransport,
   releaseServerTransportRequests,
   setAuthStateCallback,
-  setRuntimeTransportUrl,
+  type ApplyServerTransportResult,
+  type ServerTransportHealth,
 } from "./main-axios";
 import {
-  getLiveTransportUrl,
   getTailscaleTransportErrorMessage,
+  invalidateTailscaleLifecycle,
   isTailscaleConfigured,
-  recoverTailscaleTransport,
+  saveTailscaleSettings,
 } from "./utils/tailscaleConnect";
 import {
   NetworkModeDialog,
   type NetworkModeChoice,
 } from "./components/NetworkModeDialog";
-import Constants from "expo-constants";
 import { clearCachedUserId } from "./utils/user";
 
 interface Server {
@@ -48,6 +54,17 @@ interface Server {
 /** Steps the auth flow can be opened directly to. */
 export type AuthStep = "server" | "login" | "signup";
 export type TransportState = "recovering" | "ready" | "failed";
+
+export type ConnectServerTransportInput = {
+  serverUrl: string;
+  mode: NetworkModeChoice;
+  tailscaleAuthKey: string;
+  tailscaleHostname: string;
+};
+
+export type SessionValidationResult =
+  | { ok: true; health: ServerTransportHealth }
+  | { ok: false; error: string; health?: ServerTransportHealth };
 
 interface AppContextType {
   selectedServer: Server | null;
@@ -66,6 +83,14 @@ interface AppContextType {
   /** Shared transport must be ready before API calls and terminal foregrounding. */
   transportState: TransportState;
   transportReadyEpoch: number;
+  transportError: string | null;
+  retryTransport: () => void;
+  cancelTransportRecovery: () => void;
+  changeServer: () => void;
+  connectServerTransport: (
+    input: ConnectServerTransportInput,
+  ) => Promise<ApplyServerTransportResult>;
+  validateAuthenticatedSession: () => Promise<SessionValidationResult>;
 
   /** Auth flow overlay control. */
   authFlowVisible: boolean;
@@ -88,15 +113,36 @@ interface AppProviderProps {
   children: ReactNode;
 }
 
+type CoordinatorAttempt = {
+  appGeneration: number;
+  networkGeneration: number;
+  networkSignature: string;
+  mode: NetworkModeChoice;
+  controller: AbortController;
+};
+
+const UNKNOWN_NETWORK_SNAPSHOT: NetworkSnapshot = {
+  generation: 0,
+  signature: "unknown|none|vpn:0",
+  status: "unknown",
+  transport: "none",
+  systemVpn: false,
+};
+
+function canceledTransportResult(): ApplyServerTransportResult {
+  return { ok: false, error: "The connection attempt was canceled." };
+}
+
 export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const [selectedServer, setSelectedServer] = useState<Server | null>(null);
   const [isAuthenticated, setAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [showUpdateScreen, setShowUpdateScreen] = useState<boolean>(false);
+  const [showUpdateScreen, setShowUpdateScreen] = useState(false);
   const [hasServerConfigured, setHasServerConfigured] = useState(false);
   const [transportState, setTransportState] =
     useState<TransportState>("recovering");
   const [transportReadyEpoch, setTransportReadyEpoch] = useState(0);
+  const [transportError, setTransportError] = useState<string | null>(null);
 
   const [authFlowVisible, setAuthFlowVisible] = useState(false);
   const [authFlowInitialStep, setAuthFlowInitialStep] =
@@ -105,30 +151,35 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const [networkModeBusy, setNetworkModeBusy] = useState(false);
   const [networkModeServerLabel, setNetworkModeServerLabel] = useState("");
   const [networkModeError, setNetworkModeError] = useState<string | null>(null);
-  const networkModeResolverRef = useRef<
-    ((choice: NetworkModeChoice) => void) | null
-  >(null);
-  const networkModePromiseRef = useRef<Promise<NetworkModeChoice> | null>(null);
-  const networkModeOperationRef = useRef<Promise<void> | null>(null);
+  const [networkModeCanUseTailscale, setNetworkModeCanUseTailscale] =
+    useState(false);
+
+  const mountedRef = useRef(true);
+  const bootCompleteRef = useRef(false);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
-  const transportOperationGenerationRef = useRef(0);
-  const foregroundRecoveryRef = useRef<Promise<void> | null>(null);
-  const initializationStartedRef = useRef(false);
-  const initialConfigurationReadyRef = useRef<Promise<void> | null>(null);
-  const lastValidationTimeRef = useRef(0);
-  const validationInProgressRef = useRef(false);
+  const appGenerationRef = useRef(0);
+  const latestSnapshotRef = useRef<NetworkSnapshot>(UNKNOWN_NETWORK_SNAPSHOT);
+  const activeAttemptRef = useRef<CoordinatorAttempt | null>(null);
+  const authValidationControllerRef = useRef<AbortController | null>(null);
+  const lastAttemptModeRef = useRef<NetworkModeChoice | null>(null);
+  const choiceSnapshotRef = useRef<NetworkSnapshot | null>(null);
+  const authFlowVisibleRef = useRef(false);
 
   const openAuthFlow = useCallback((step: AuthStep = "server") => {
+    authFlowVisibleRef.current = true;
     setAuthFlowInitialStep(step);
     setAuthFlowVisible(true);
   }, []);
 
   const closeAuthFlow = useCallback(() => {
+    authFlowVisibleRef.current = false;
     setAuthFlowVisible(false);
   }, []);
 
   const markTransportReady = useCallback(() => {
+    if (!mountedRef.current) return;
     setTransportState("ready");
+    setTransportError(null);
     setNetworkModeError(null);
     setTransportReadyEpoch((epoch) => epoch + 1);
     releaseServerTransportRequests();
@@ -136,466 +187,604 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
   const markTransportFailed = useCallback((error: unknown) => {
     const message = getTailscaleTransportErrorMessage(error);
-    // Reject requests that were waiting on the failed recovery, then immediately
-    // install a new barrier so later work cannot leak to the stale port while the
-    // retry/Direct chooser is open.
-    failServerTransportRequests(
-      error instanceof Error ? error : new Error(message),
-    );
+    const reason = error instanceof Error ? error : new Error(message);
+    // Reject work waiting on this attempt, then install a fresh barrier so later
+    // requests cannot leak to a stale localhost port while recovery UI is open.
+    failServerTransportRequests(reason);
     blockServerTransportRequests();
-    setTransportState("failed");
-    setNetworkModeError(message);
+    if (mountedRef.current) {
+      setTransportState("failed");
+      setTransportError(message);
+      setNetworkModeError(message);
+    }
     return message;
   }, []);
 
-  const promptNetworkMode = useCallback(
+  const clearAuthenticatedSession = useCallback(async () => {
+    setAuthenticated(false);
+    clearCachedUserId();
+    await clearAuth();
+  }, []);
+
+  const supersedeCoordinator = useCallback(() => {
+    appGenerationRef.current += 1;
+    activeAttemptRef.current?.controller.abort();
+    activeAttemptRef.current = null;
+    authValidationControllerRef.current?.abort();
+    authValidationControllerRef.current = null;
+    if (mountedRef.current) setNetworkModeBusy(false);
+    return appGenerationRef.current;
+  }, []);
+
+  const prepareTransportGate = useCallback(() => {
+    blockServerTransportRequests();
+    if (!mountedRef.current) return;
+    setTransportState("recovering");
+    setTransportError(null);
+    setNetworkModeError(null);
+  }, []);
+
+  const isAttemptCurrent = useCallback((attempt: CoordinatorAttempt) => {
+    const snapshot = latestSnapshotRef.current;
+    return (
+      mountedRef.current &&
+      appStateRef.current === "active" &&
+      !attempt.controller.signal.aborted &&
+      activeAttemptRef.current === attempt &&
+      appGenerationRef.current === attempt.appGeneration &&
+      snapshot.generation === attempt.networkGeneration &&
+      snapshot.signature === attempt.networkSignature
+    );
+  }, []);
+
+  const syncAuthenticationFromHealth = useCallback(
+    async (health: ServerTransportHealth, openLoginOnExpiry: boolean) => {
+      if (health.sessionState === "unauthorized") {
+        await clearAuthenticatedSession();
+        if (openLoginOnExpiry) openAuthFlow("login");
+        return;
+      }
+      if (
+        health.sessionState === "authenticated" &&
+        health.hostsState === "healthy" &&
+        health.userInfo?.data_unlocked !== false
+      ) {
+        setAuthenticated(true);
+        return;
+      }
+      // A token may still exist after transient/proxy failures. Keep it on disk,
+      // but never mount authenticated screens until both user and Hosts validate.
+      setAuthenticated(false);
+    },
+    [clearAuthenticatedSession, openAuthFlow],
+  );
+
+  const showNetworkModePrompt = useCallback(
     (
-      serverLabel: string,
+      snapshot: NetworkSnapshot,
+      canUseTailscale: boolean,
       initialError?: string | null,
-    ): Promise<NetworkModeChoice> => {
-      setNetworkModeServerLabel(serverLabel);
+    ) => {
+      choiceSnapshotRef.current = snapshot;
+      setNetworkModeServerLabel(
+        getDisplayServerUrl() || getCurrentServerUrl() || "",
+      );
+      setNetworkModeCanUseTailscale(canUseTailscale);
       setNetworkModeBusy(false);
       setNetworkModeError(initialError || null);
       setNetworkModeVisible(true);
-
-      if (networkModePromiseRef.current) {
-        return networkModePromiseRef.current;
-      }
-
-      const promise = new Promise<NetworkModeChoice>((resolve) => {
-        networkModeResolverRef.current = resolve;
-      });
-      networkModePromiseRef.current = promise;
-      return promise;
     },
     [],
   );
 
-  const resolveNetworkModePrompt = useCallback((choice: NetworkModeChoice) => {
-    const resolve = networkModeResolverRef.current;
-    networkModeResolverRef.current = null;
-    networkModePromiseRef.current = null;
-    setNetworkModeBusy(false);
-    setNetworkModeVisible(false);
-    resolve?.(choice);
-  }, []);
+  const executeTransportMode = useCallback(
+    async (
+      mode: NetworkModeChoice,
+      snapshot: NetworkSnapshot,
+      options: {
+        appGeneration?: number;
+        displayUrl?: string;
+        showDialogOnFailure?: boolean;
+        openLoginOnExpiry?: boolean;
+      } = {},
+    ): Promise<ApplyServerTransportResult> => {
+      const appGeneration = options.appGeneration ?? supersedeCoordinator();
+      if (appGeneration !== appGenerationRef.current) {
+        return canceledTransportResult();
+      }
 
-  const handleNetworkModeChoice = useCallback(
-    (choice: NetworkModeChoice) => {
-      if (networkModeOperationRef.current) return;
-
-      const generation = transportOperationGenerationRef.current;
+      const controller = new AbortController();
+      const attempt: CoordinatorAttempt = {
+        appGeneration,
+        networkGeneration: snapshot.generation,
+        networkSignature: snapshot.signature,
+        mode,
+        controller,
+      };
+      activeAttemptRef.current = attempt;
+      lastAttemptModeRef.current = mode;
+      prepareTransportGate();
       setNetworkModeBusy(true);
       setNetworkModeError(null);
 
-      const operation = (async () => {
-        try {
-          const result = await applyServerTransportMode(choice);
-          const isCurrent =
-            generation === transportOperationGenerationRef.current &&
-            appStateRef.current === "active";
-
-          if (!result.ok) {
-            if (isCurrent) {
-              markTransportFailed(new Error(result.error));
-            }
-            setNetworkModeBusy(false);
-            return;
-          }
-
-          // A selection that finishes after backgrounding may persist its choice,
-          // but it must not release the newer background barrier. Foreground
-          // recovery waits for this operation and validates the final choice.
-          if (isCurrent) {
-            markTransportReady();
-          }
-          resolveNetworkModePrompt(choice);
-        } catch (error) {
-          const isCurrent =
-            generation === transportOperationGenerationRef.current &&
-            appStateRef.current === "active";
-          if (isCurrent) {
-            markTransportFailed(error);
-          }
-          setNetworkModeBusy(false);
-        }
-      })();
-
-      networkModeOperationRef.current = operation;
-      const clearOperation = () => {
-        if (networkModeOperationRef.current === operation) {
-          networkModeOperationRef.current = null;
-        }
-      };
-      void operation.then(clearOperation, clearOperation);
-    },
-    [markTransportFailed, markTransportReady, resolveNetworkModePrompt],
-  );
-
-  const handleNetworkModeDismiss = useCallback(() => {
-    // The close button is an explicit Direct/LAN choice; failures stay visible.
-    void handleNetworkModeChoice("direct");
-  }, [handleNetworkModeChoice]);
-
-  const checkShouldShowUpdateScreen =
-    useCallback(async (): Promise<boolean> => {
+      let result: ApplyServerTransportResult;
       try {
-        const currentAppVersion = Constants.expoConfig?.version || "1.0.0";
-        const latestRelease = await getLatestGitHubRelease();
-        if (!latestRelease || currentAppVersion === latestRelease.version) {
-          return false;
-        }
-
-        const dismissedVersion = await AsyncStorage.getItem(
-          "dismissedUpdateVersion",
-        );
-        return dismissedVersion !== latestRelease.version;
-      } catch {
-        return false;
-      }
-    }, []);
-
-  const validatePersistedSession = useCallback(async () => {
-    if (validationInProgressRef.current) return;
-
-    const now = Date.now();
-    if (now - lastValidationTimeRef.current < 2000) return;
-
-    validationInProgressRef.current = true;
-    lastValidationTimeRef.current = now;
-    try {
-      const userInfo = await getUserInfo();
-      if (!userInfo?.username || userInfo.data_unlocked === false) {
-        setAuthenticated(false);
-      }
-    } catch {
-      // Network failures do not clear a valid persisted login. The centralized
-      // API 401 callback remains authoritative for expired credentials.
-    } finally {
-      validationInProgressRef.current = false;
-    }
-  }, []);
-
-  const recoverSelectedTransport = useCallback(
-    async (generation: number) => {
-      const config = getServerConfigMeta();
-      const displayUrl = getDisplayServerUrl();
-
-      if (config?.viaTailscale) {
-        if (!displayUrl) {
-          throw new Error("No Tailscale server address is configured.");
-        }
-        const recovered = await recoverTailscaleTransport(displayUrl);
-        if (generation !== transportOperationGenerationRef.current)
-          return false;
-
-        await setRuntimeTransportUrl(recovered.transportUrl, {
-          detect: false,
+        result = await applyServerTransportMode(mode, {
+          displayUrl: options.displayUrl,
+          networkSignature: snapshot.signature,
+          networkGeneration: snapshot.generation,
+          signal: controller.signal,
         });
-        if (generation !== transportOperationGenerationRef.current)
-          return false;
-
-        await detectServerRoutes();
-        if (generation !== transportOperationGenerationRef.current)
-          return false;
+      } catch (error) {
+        if (!isAttemptCurrent(attempt)) return canceledTransportResult();
+        activeAttemptRef.current = null;
+        const message = markTransportFailed(error);
+        setNetworkModeBusy(false);
+        if (
+          options.showDialogOnFailure !== false &&
+          !authFlowVisibleRef.current
+        ) {
+          showNetworkModePrompt(
+            snapshot,
+            await isTailscaleConfigured().catch(() => false),
+            message,
+          );
+        }
+        return { ok: false, error: message };
       }
 
-      if (
-        generation !== transportOperationGenerationRef.current ||
-        appStateRef.current !== "active"
-      ) {
-        return false;
+      if (!isAttemptCurrent(attempt)) return canceledTransportResult();
+
+      if (!result.ok) {
+        activeAttemptRef.current = null;
+        const message = markTransportFailed(new Error(result.error));
+        setNetworkModeBusy(false);
+        if (
+          options.showDialogOnFailure !== false &&
+          !authFlowVisibleRef.current
+        ) {
+          const canUseTailscale = await isTailscaleConfigured().catch(
+            () => false,
+          );
+          if (
+            appGeneration === appGenerationRef.current &&
+            appStateRef.current === "active"
+          ) {
+            showNetworkModePrompt(snapshot, canUseTailscale, message);
+          }
+        }
+        return result;
       }
+
+      await syncAuthenticationFromHealth(
+        result.health,
+        options.openLoginOnExpiry !== false,
+      );
+      if (!isAttemptCurrent(attempt)) return canceledTransportResult();
+
+      activeAttemptRef.current = null;
+      choiceSnapshotRef.current = null;
+      setNetworkModeBusy(false);
+      setNetworkModeVisible(false);
+      const displayUrl =
+        getDisplayServerUrl() || options.displayUrl || "Server";
+      setSelectedServer({ name: "Server", ip: displayUrl });
+      setHasServerConfigured(true);
       markTransportReady();
-      resolveNetworkModePrompt(config?.viaTailscale ? "tailscale" : "direct");
-      return true;
+      return result;
     },
-    [markTransportReady, resolveNetworkModePrompt],
+    [
+      isAttemptCurrent,
+      markTransportFailed,
+      markTransportReady,
+      prepareTransportGate,
+      showNetworkModePrompt,
+      supersedeCoordinator,
+      syncAuthenticationFromHealth,
+    ],
   );
 
-  const runForegroundRecovery = useCallback((): Promise<void> => {
-    if (foregroundRecoveryRef.current) {
-      return foregroundRecoveryRef.current;
-    }
+  const coordinateTransport = useCallback(
+    async (snapshot: NetworkSnapshot) => {
+      if (!bootCompleteRef.current || appStateRef.current !== "active") return;
 
-    const generation = ++transportOperationGenerationRef.current;
-    blockServerTransportRequests();
-    setTransportState("recovering");
+      const appGeneration = supersedeCoordinator();
+      prepareTransportGate();
+      setNetworkModeVisible(false);
 
-    const recovery = (async () => {
-      const initialConfigurationReady = initialConfigurationReadyRef.current;
-      if (initialConfigurationReady) {
-        await initialConfigurationReady;
+      const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
+      const config = getServerConfigMeta();
+      if (!displayUrl) {
+        setSelectedServer(null);
+        setHasServerConfigured(false);
+        setAuthenticated(false);
+        markTransportReady();
+        openAuthFlow("server");
+        return;
       }
 
-      const pendingModeOperation = networkModeOperationRef.current;
-      if (pendingModeOperation) {
-        await pendingModeOperation;
-      }
+      setSelectedServer({ name: "Server", ip: displayUrl });
+      setHasServerConfigured(true);
+      const canUseTailscale = await isTailscaleConfigured().catch(() => false);
       if (
-        generation !== transportOperationGenerationRef.current ||
+        appGeneration !== appGenerationRef.current ||
         appStateRef.current !== "active"
       ) {
         return;
       }
 
+      const topologyChanged =
+        !config?.lastNetworkSignature ||
+        config.lastNetworkSignature !== snapshot.signature;
+      if (topologyChanged && canUseTailscale) {
+        showNetworkModePrompt(snapshot, true);
+        return;
+      }
+
+      const mode: NetworkModeChoice =
+        config?.viaTailscale && canUseTailscale ? "tailscale" : "direct";
+      await executeTransportMode(mode, snapshot, {
+        appGeneration,
+        showDialogOnFailure: true,
+        openLoginOnExpiry: true,
+      });
+    },
+    [
+      executeTransportMode,
+      markTransportReady,
+      openAuthFlow,
+      prepareTransportGate,
+      showNetworkModePrompt,
+      supersedeCoordinator,
+    ],
+  );
+
+  const adoptFreshSnapshot = useCallback((snapshot: NetworkSnapshot) => {
+    const current = latestSnapshotRef.current;
+    if (snapshot.generation < current.generation) return current;
+    if (
+      snapshot.signature !== current.signature ||
+      snapshot.generation !== current.generation
+    ) {
+      latestSnapshotRef.current = snapshot;
+    }
+    return latestSnapshotRef.current;
+  }, []);
+
+  const refreshSnapshotAndCoordinate = useCallback(async () => {
+    const generationBeforeRead = appGenerationRef.current;
+    let snapshot = latestSnapshotRef.current;
+    try {
+      const nativeSnapshot = await getTermixTailscaleNetworkSnapshot();
+      if (nativeSnapshot.signature !== snapshot.signature) {
+        invalidateTailscaleLifecycle(nativeSnapshot.generation);
+      }
+      snapshot = adoptFreshSnapshot(nativeSnapshot);
+    } catch {
+      // The normalized fallback remains stable on builds without the module.
+    }
+    if (
+      appStateRef.current !== "active" ||
+      generationBeforeRead !== appGenerationRef.current
+    ) {
+      return;
+    }
+    await coordinateTransport(snapshot);
+  }, [adoptFreshSnapshot, coordinateTransport]);
+
+  const retryTransport = useCallback(() => {
+    void refreshSnapshotAndCoordinate();
+  }, [refreshSnapshotAndCoordinate]);
+
+  const cancelTransportRecovery = useCallback(() => {
+    supersedeCoordinator();
+    cancelTermixTailscaleCurrentOperation();
+    setNetworkModeVisible(false);
+    setNetworkModeBusy(false);
+    setIsLoading(false);
+    markTransportFailed(new Error("The connection attempt was canceled."));
+  }, [markTransportFailed, supersedeCoordinator]);
+
+  const changeServer = useCallback(() => {
+    supersedeCoordinator();
+    cancelTermixTailscaleCurrentOperation();
+    setNetworkModeVisible(false);
+    setNetworkModeBusy(false);
+    setIsLoading(false);
+    setAuthenticated(false);
+    clearCachedUserId();
+    void clearSession().catch(() => undefined);
+    markTransportFailed(
+      new Error("Choose a server and connection mode to continue."),
+    );
+    openAuthFlow("server");
+  }, [markTransportFailed, openAuthFlow, supersedeCoordinator]);
+
+  const connectServerTransport = useCallback(
+    async (
+      input: ConnectServerTransportInput,
+    ): Promise<ApplyServerTransportResult> => {
+      setAuthenticated(false);
       try {
-        const ready = await recoverSelectedTransport(generation);
-        if (!ready || generation !== transportOperationGenerationRef.current) {
-          return;
-        }
+        await saveTailscaleSettings({
+          authKey: input.tailscaleAuthKey,
+          hostname: input.tailscaleHostname,
+        });
       } catch (error) {
-        if (generation !== transportOperationGenerationRef.current) return;
-        const displayUrl = getDisplayServerUrl();
         const message = markTransportFailed(error);
-        if (!displayUrl) return;
-        await promptNetworkMode(displayUrl, message);
+        return { ok: false, error: message };
       }
 
-      if (
-        generation === transportOperationGenerationRef.current &&
-        appStateRef.current === "active"
-      ) {
-        setIsLoading(false);
-        if (isAuthenticated) {
-          await validatePersistedSession();
+      let snapshot = latestSnapshotRef.current;
+      try {
+        const nativeSnapshot = await getTermixTailscaleNetworkSnapshot();
+        if (nativeSnapshot.signature !== snapshot.signature) {
+          invalidateTailscaleLifecycle(nativeSnapshot.generation);
+        }
+        snapshot = adoptFreshSnapshot(nativeSnapshot);
+      } catch {
+        // Use the last immutable snapshot.
+      }
+
+      return executeTransportMode(input.mode, snapshot, {
+        displayUrl: input.serverUrl,
+        showDialogOnFailure: false,
+        openLoginOnExpiry: false,
+      });
+    },
+    [adoptFreshSnapshot, executeTransportMode, markTransportFailed],
+  );
+
+  const validateAuthenticatedSession =
+    useCallback(async (): Promise<SessionValidationResult> => {
+      const token = await AsyncStorage.getItem("jwt");
+      const runtimeUrl = getCurrentServerUrl();
+      if (!token || !runtimeUrl) {
+        setAuthenticated(false);
+        return {
+          ok: false as const,
+          error: "No reusable login session is available.",
+        };
+      }
+
+      authValidationControllerRef.current?.abort();
+      const controller = new AbortController();
+      authValidationControllerRef.current = controller;
+      const appGeneration = appGenerationRef.current;
+      const snapshot = latestSnapshotRef.current;
+
+      try {
+        const health = await probeServerTransport(runtimeUrl, {
+          token,
+          signal: controller.signal,
+        });
+        if (
+          controller.signal.aborted ||
+          appGeneration !== appGenerationRef.current ||
+          snapshot.generation !== latestSnapshotRef.current.generation
+        ) {
+          return {
+            ok: false as const,
+            error: "The network changed while the session was being validated.",
+          };
+        }
+        if (health.sessionState === "unauthorized") {
+          await clearAuthenticatedSession();
+          return {
+            ok: false as const,
+            error: health.error || "The server rejected the login session.",
+            health,
+          };
+        }
+        if (
+          health.ok &&
+          health.sessionState === "authenticated" &&
+          health.hostsState === "healthy" &&
+          health.userInfo?.data_unlocked !== false
+        ) {
+          setAuthenticated(true);
+          return { ok: true as const, health };
+        }
+        setAuthenticated(false);
+        return {
+          ok: false as const,
+          error:
+            health.error ||
+            "Signed in, but the Termix user and Hosts APIs could not be validated.",
+          health,
+        };
+      } catch (error) {
+        setAuthenticated(false);
+        return {
+          ok: false as const,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Could not validate the login session.",
+        };
+      } finally {
+        if (authValidationControllerRef.current === controller) {
+          authValidationControllerRef.current = null;
         }
       }
-    })();
+    }, [clearAuthenticatedSession]);
 
-    foregroundRecoveryRef.current = recovery;
-    const clearRecovery = () => {
-      if (foregroundRecoveryRef.current === recovery) {
-        foregroundRecoveryRef.current = null;
+  const handleNetworkModeChoice = useCallback(
+    (choice: NetworkModeChoice) => {
+      const snapshot = choiceSnapshotRef.current || latestSnapshotRef.current;
+      void executeTransportMode(choice, snapshot, {
+        showDialogOnFailure: true,
+        openLoginOnExpiry: true,
+      });
+    },
+    [executeTransportMode],
+  );
+
+  const handleNetworkModeRetry = useCallback(() => {
+    const mode = lastAttemptModeRef.current;
+    if (!mode) {
+      retryTransport();
+      return;
+    }
+    const snapshot = choiceSnapshotRef.current || latestSnapshotRef.current;
+    void executeTransportMode(mode, snapshot, {
+      showDialogOnFailure: true,
+      openLoginOnExpiry: true,
+    });
+  }, [executeTransportMode, retryTransport]);
+
+  const checkShouldShowUpdateScreen = useCallback(async () => {
+    try {
+      const currentAppVersion = Constants.expoConfig?.version || "1.0.0";
+      const latestRelease = await getLatestGitHubRelease();
+      if (!latestRelease || currentAppVersion === latestRelease.version) {
+        return false;
       }
-    };
-    void recovery.then(clearRecovery, clearRecovery);
-    return recovery;
-  }, [
-    isAuthenticated,
-    markTransportFailed,
-    promptNetworkMode,
-    recoverSelectedTransport,
-    validatePersistedSession,
-  ]);
+      const dismissedVersion = await AsyncStorage.getItem(
+        "dismissedUpdateVersion",
+      );
+      return dismissedVersion !== latestRelease.version;
+    } catch {
+      return false;
+    }
+  }, []);
 
   useEffect(() => {
-    if (initializationStartedRef.current) return;
-    initializationStartedRef.current = true;
+    mountedRef.current = true;
+
+    const handleNetworkChange = (snapshot: NetworkSnapshot) => {
+      const previous = latestSnapshotRef.current;
+      if (
+        snapshot.generation < previous.generation ||
+        (snapshot.generation === previous.generation &&
+          snapshot.signature === previous.signature)
+      ) {
+        return;
+      }
+
+      latestSnapshotRef.current = snapshot;
+      invalidateTailscaleLifecycle(snapshot.generation);
+      supersedeCoordinator();
+      prepareTransportGate();
+      setNetworkModeVisible(false);
+      choiceSnapshotRef.current = snapshot;
+      if (bootCompleteRef.current && appStateRef.current === "active") {
+        void coordinateTransport(snapshot);
+      }
+    };
+
+    const handleAppStateChange = (nextAppState: AppStateStatus) => {
+      appStateRef.current = nextAppState;
+      if (!bootCompleteRef.current) return;
+
+      if (nextAppState !== "active") {
+        supersedeCoordinator();
+        prepareTransportGate();
+        setNetworkModeVisible(false);
+        return;
+      }
+
+      void refreshSnapshotAndCoordinate();
+    };
+
+    const networkSubscription =
+      addTermixTailscaleNetworkChangeListener(handleNetworkChange);
+    const appStateSubscription = AppState.addEventListener(
+      "change",
+      handleAppStateChange,
+    );
 
     const initializeApp = async () => {
-      const generation = ++transportOperationGenerationRef.current;
-      const canPublishTransport = () =>
-        generation === transportOperationGenerationRef.current &&
-        appStateRef.current === "active";
-      let resolveInitialConfiguration!: () => void;
-      initialConfigurationReadyRef.current = new Promise<void>((resolve) => {
-        resolveInitialConfiguration = resolve;
-      });
-
       blockServerTransportRequests();
       setTransportState("recovering");
+      setIsLoading(true);
       try {
-        setIsLoading(true);
+        await initializeServerConfig({
+          rehydrateTailscale: false,
+          detect: false,
+        });
+
         try {
-          await initializeServerConfig({
-            rehydrateTailscale: false,
-            detect: false,
-          });
-        } finally {
-          // Foreground recovery may have started while storage was loading. It
-          // must not inspect transport metadata until this initial read settles.
-          resolveInitialConfiguration();
+          adoptFreshSnapshot(await getTermixTailscaleNetworkSnapshot());
+        } catch {
+          // Keep the normalized unknown snapshot.
         }
 
-        const serverConfig = await AsyncStorage.getItem("serverConfig");
-        const legacyServer = await AsyncStorage.getItem("server");
-        const serverConfigured = !!(serverConfig || legacyServer);
-        setHasServerConfigured(serverConfigured);
-        setSelectedServer(
-          serverConfigured
-            ? {
-                name: "Server",
-                ip: getDisplayServerUrl() || getCurrentServerUrl() || "Server",
-              }
-            : null,
-        );
-
-        if (serverConfigured) {
-          const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
-          const config = getServerConfigMeta();
-          const tsConfigured = await isTailscaleConfigured();
-          let transportCommitted = false;
-
-          if (displayUrl && config?.viaTailscale) {
-            const live = await getLiveTransportUrl(displayUrl);
-            if (live && canPublishTransport()) {
-              await setRuntimeTransportUrl(live, { detect: false });
-              if (canPublishTransport()) {
-                await detectServerRoutes();
-              }
-              if (canPublishTransport()) {
-                markTransportReady();
-                resolveNetworkModePrompt("tailscale");
-                transportCommitted = true;
-              }
-            }
-          }
-
-          if (
-            !transportCommitted &&
-            displayUrl &&
-            (tsConfigured || config?.viaTailscale) &&
-            canPublishTransport()
-          ) {
-            // Keep the route tree behind the loading screen. The provider-level
-            // Modal remains visible and resolves only after a transport succeeds.
-            await promptNetworkMode(displayUrl);
-            transportCommitted = canPublishTransport();
-          }
-
-          if (!transportCommitted && canPublishTransport()) {
-            await detectServerRoutes();
-            if (canPublishTransport()) {
-              markTransportReady();
-              transportCommitted = true;
-            }
-          }
-
-          const jwtToken = await AsyncStorage.getItem("jwt");
-          if (jwtToken) {
-            const validationPromise = getUserInfo();
-            const validationResult = await Promise.race([
-              validationPromise.then(
-                (user) => ({ type: "user" as const, user }),
-                (error) => ({ type: "error" as const, error }),
-              ),
-              new Promise<{ type: "timeout" }>((resolve) => {
-                setTimeout(() => resolve({ type: "timeout" }), 1500);
-              }),
-            ]);
-
-            if (validationResult.type === "user") {
-              setAuthenticated(
-                !!(
-                  validationResult.user?.username &&
-                  validationResult.user.data_unlocked !== false
-                ),
-              );
-            } else if (
-              validationResult.type === "error" &&
-              isUnauthorizedError(validationResult.error)
-            ) {
-              clearCachedUserId();
-              await clearAuth();
-              setAuthenticated(false);
-            } else {
-              setAuthenticated(true);
-              if (validationResult.type === "timeout") {
-                void validationPromise
-                  .then((user) => {
-                    setAuthenticated(
-                      !!(user?.username && user.data_unlocked !== false),
-                    );
-                  })
-                  .catch(async (error) => {
-                    if (isUnauthorizedError(error)) {
-                      clearCachedUserId();
-                      await clearAuth();
-                      setAuthenticated(false);
-                    }
-                  });
-              }
-            }
-          } else {
-            setAuthenticated(false);
-          }
-
-          void getVersionInfo().catch((error) => {
-            console.warn("[AppContext] Version check failed:", error);
-          });
-        } else {
-          if (canPublishTransport()) {
-            markTransportReady();
-          }
-          setAuthenticated(false);
-          openAuthFlow("server");
-        }
-
-        void checkShouldShowUpdateScreen().then(setShowUpdateScreen);
-      } catch (error) {
         const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
         setHasServerConfigured(!!displayUrl);
         setSelectedServer(
           displayUrl ? { name: "Server", ip: displayUrl } : null,
         );
         setAuthenticated(false);
+        bootCompleteRef.current = true;
+        setIsLoading(false);
 
-        if (canPublishTransport()) {
-          if (displayUrl) {
-            const message = markTransportFailed(error);
-            await promptNetworkMode(displayUrl, message);
-          } else {
-            markTransportReady();
-            openAuthFlow("server");
-          }
+        if (appStateRef.current === "active") {
+          await coordinateTransport(latestSnapshotRef.current);
+        }
+
+        void getVersionInfo().catch((error) => {
+          console.warn("[AppContext] Version check failed:", error);
+        });
+        void checkShouldShowUpdateScreen().then((show) => {
+          if (mountedRef.current) setShowUpdateScreen(show);
+        });
+      } catch (error) {
+        bootCompleteRef.current = true;
+        setIsLoading(false);
+        const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
+        setHasServerConfigured(!!displayUrl);
+        setSelectedServer(
+          displayUrl ? { name: "Server", ip: displayUrl } : null,
+        );
+        setAuthenticated(false);
+        if (displayUrl) {
+          const message = markTransportFailed(error);
+          showNetworkModePrompt(
+            latestSnapshotRef.current,
+            await isTailscaleConfigured().catch(() => false),
+            message,
+          );
+        } else {
+          markTransportReady();
+          openAuthFlow("server");
         }
         console.error("[AppContext] Failed to initialize app:", error);
-      } finally {
-        if (canPublishTransport()) {
-          setIsLoading(false);
-        }
       }
     };
 
     void initializeApp();
+    return () => {
+      mountedRef.current = false;
+      supersedeCoordinator();
+      networkSubscription?.remove();
+      appStateSubscription.remove();
+    };
   }, [
+    adoptFreshSnapshot,
     checkShouldShowUpdateScreen,
+    coordinateTransport,
     markTransportFailed,
     markTransportReady,
     openAuthFlow,
-    promptNetworkMode,
-    resolveNetworkModePrompt,
+    prepareTransportGate,
+    refreshSnapshotAndCoordinate,
+    showNetworkModePrompt,
+    supersedeCoordinator,
   ]);
 
   useEffect(() => {
     setAuthStateCallback((authed: boolean) => {
-      if (!authed) {
-        setAuthenticated(false);
-        clearCachedUserId();
-        void clearAuth();
-      }
+      if (!authed) void clearAuthenticatedSession();
     });
-  }, []);
+  }, [clearAuthenticatedSession]);
 
+  // The auth flow can commit a new server without changing authentication state.
   useEffect(() => {
-    const handleAppStateChange = (nextAppState: AppStateStatus) => {
-      appStateRef.current = nextAppState;
-
-      if (nextAppState !== "active") {
-        transportOperationGenerationRef.current += 1;
-        foregroundRecoveryRef.current = null;
-        blockServerTransportRequests();
-        setTransportState("recovering");
-        return;
-      }
-
-      void runForegroundRecovery();
-    };
-
-    const subscription = AppState.addEventListener(
-      "change",
-      handleAppStateChange,
-    );
-    return () => subscription.remove();
-  }, [runForegroundRecovery]);
-
-  // Keep hasServerConfigured in sync whenever the auth flow closes (the user
-  // may have just added or changed a server inside it).
-  useEffect(() => {
-    if (!authFlowVisible) {
-      setHasServerConfigured(!!getCurrentServerUrl());
-    }
+    if (authFlowVisible) return;
+    const displayUrl = getDisplayServerUrl() || getCurrentServerUrl();
+    setHasServerConfigured(!!displayUrl);
+    setSelectedServer(displayUrl ? { name: "Server", ip: displayUrl } : null);
   }, [authFlowVisible]);
 
   return (
@@ -613,6 +802,12 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         setHasServerConfigured,
         transportState,
         transportReadyEpoch,
+        transportError,
+        retryTransport,
+        cancelTransportRecovery,
+        changeServer,
+        connectServerTransport,
+        validateAuthenticatedSession,
         authFlowVisible,
         authFlowInitialStep,
         openAuthFlow,
@@ -623,12 +818,14 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       <NetworkModeDialog
         visible={networkModeVisible}
         busy={networkModeBusy}
+        canUseTailscale={networkModeCanUseTailscale}
+        retryMode={lastAttemptModeRef.current}
         serverLabel={networkModeServerLabel}
         errorMessage={networkModeError}
-        onChoose={(mode) => {
-          void handleNetworkModeChoice(mode);
-        }}
-        onDismiss={handleNetworkModeDismiss}
+        onChoose={handleNetworkModeChoice}
+        onRetry={handleNetworkModeRetry}
+        onCancel={cancelTransportRecovery}
+        onChangeServer={changeServer}
       />
     </AppContext.Provider>
   );

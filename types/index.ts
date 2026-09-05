@@ -996,7 +996,7 @@ export interface UserInfo {
   username: string;
   is_admin: boolean;
   is_oidc: boolean;
-  data_unlocked: boolean;
+  data_unlocked?: boolean;
 }
 
 export interface UserCount {

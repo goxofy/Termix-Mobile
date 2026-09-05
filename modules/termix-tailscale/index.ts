@@ -88,21 +88,34 @@ export function isTermixTailscaleAvailable(): boolean {
 
 /** Returns the latest immutable native connectivity snapshot. */
 export async function getTermixTailscaleNetworkSnapshot(): Promise<NetworkSnapshot> {
-  if (!Native) return { ...UNKNOWN_NETWORK_SNAPSHOT };
-  return Native.getNetworkSnapshot();
+  if (!Native?.getNetworkSnapshot) return { ...UNKNOWN_NETWORK_SNAPSHOT };
+  try {
+    return await Native.getNetworkSnapshot();
+  } catch {
+    return { ...UNKNOWN_NETWORK_SNAPSHOT };
+  }
 }
 
 /** Subscribes to material connectivity/signature changes only. */
 export function addTermixTailscaleNetworkChangeListener(
   listener: (snapshot: NetworkSnapshot) => void,
 ): EventSubscription | null {
-  if (!Native) return null;
-  return Native.addListener("onNetworkChanged", listener);
+  if (!Native?.addListener) return null;
+  try {
+    return Native.addListener("onNetworkChanged", listener);
+  } catch {
+    return null;
+  }
 }
 
 /** Immediately invalidates/cancels native lifecycle work without waiting. */
 export function cancelTermixTailscaleCurrentOperation(): void {
-  Native?.cancelCurrentOperation();
+  try {
+    Native?.cancelCurrentOperation?.();
+  } catch {
+    // Cancellation is best-effort and must never escape a timer, abort event,
+    // or background cleanup callback.
+  }
 }
 
 export async function configureTermixTailscale(

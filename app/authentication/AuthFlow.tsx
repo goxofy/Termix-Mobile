@@ -31,36 +31,28 @@ import { useThemeColor } from "@/app/contexts/ThemeContext";
 import { toast } from "@/app/utils/toast";
 import { clearCachedUserId } from "@/app/utils/user";
 import {
-  connectServerViaTailscale,
   isTailscaleNativeAvailable,
   loadTailscaleSettings,
-  saveTailscaleSettings,
-  shutdownTailscale,
 } from "@/app/utils/tailscaleConnect";
 import { useAppContext } from "../AppContext";
 import {
-  saveServerConfig,
   getCurrentServerUrl,
   getDisplayServerUrl,
-  initializeServerConfig,
+  getServerConfigMeta,
   setCookie,
-  getUserInfo,
   loginUser,
   registerUser,
   verifyTOTPLogin,
   initiatePasswordReset,
   verifyPasswordResetCode,
   completePasswordReset,
-  getSetupRequired,
-  getRegistrationAllowed,
-  getPasswordLoginAllowed,
   getOIDCConfig,
   getOIDCAuthorizeUrl,
-  isReverseProxyAuthGate,
+  probeServerTransport,
   clearSession,
   consumeFreshWebSession,
   logoutUser,
-  isUnauthorizedError,
+  type ServerTransportHealth,
 } from "../main-axios";
 
 type Step = "server" | "login" | "totp" | "signup" | "reset" | "oidc";
@@ -88,6 +80,8 @@ export default function AuthFlow() {
     closeAuthFlow,
     setAuthenticated,
     setSelectedServer,
+    connectServerTransport,
+    validateAuthenticatedSession,
   } = useAppContext();
   const insets = useSafeAreaInsets();
   const color = useThemeColor();
@@ -118,16 +112,18 @@ export default function AuthFlow() {
   useEffect(() => {
     const current = getDisplayServerUrl() ?? getCurrentServerUrl();
     if (current) setServerUrl(current);
-    void loadTailscaleSettings().then((s) => {
-      setUseTailscale(s.enabled && tailscaleAvailable);
-      if (s.authKey) setTailscaleAuthKey(s.authKey);
-      if (s.hostname) setTailscaleHostname(s.hostname);
-    });
+    setUseTailscale(
+      !!getServerConfigMeta()?.viaTailscale && tailscaleAvailable,
+    );
+    void loadTailscaleSettings()
+      .then((s) => {
+        if (s.authKey) setTailscaleAuthKey(s.authKey);
+        if (s.hostname) setTailscaleHostname(s.hostname);
+      })
+      .catch(() => undefined);
   }, [tailscaleAvailable]);
 
   const finishAuthenticated = useCallback(async () => {
-    // Persist a usable login session (main) while preserving a live Tailscale
-    // localhost forward (research) — a full rehydrate would tear it down.
     const savedToken = await AsyncStorage.getItem("jwt");
     if (!savedToken) {
       throw new Error(
@@ -135,80 +131,60 @@ export default function AuthFlow() {
       );
     }
 
-    try {
-      await initializeServerConfig({ rehydrateTailscale: false });
-    } catch {}
+    const validation = await validateAuthenticatedSession();
+    if (!validation.ok) throw new Error(validation.error);
+
     const url = getDisplayServerUrl() ?? getCurrentServerUrl();
     if (url) setSelectedServer({ name: "Server", ip: url });
     setAuthenticated(true);
     closeAuthFlow();
-  }, [closeAuthFlow, setAuthenticated, setSelectedServer]);
+  }, [
+    closeAuthFlow,
+    setAuthenticated,
+    setSelectedServer,
+    validateAuthenticatedSession,
+  ]);
 
   // ── Step: server ────────────────────────────────────────────────────────
 
-  /**
-   * Probes the currently-configured server to decide which sign-in affordances
-   * to show, then advances to the appropriate step. Returns false on failure
-   * (server unreachable) so callers can react.
-   */
-  const probeServer = useCallback(async (): Promise<boolean> => {
-    if (FORCE_WEBVIEW_LOGIN) {
-      setStep("oidc");
-      return true;
-    }
+  const advanceFromTransportHealth = useCallback(
+    async (health: ServerTransportHealth): Promise<boolean> => {
+      if (!health.ok) return false;
+      if (FORCE_WEBVIEW_LOGIN || health.sessionState === "proxy-auth") {
+        setCaps({
+          setupRequired: false,
+          passwordLoginAllowed: false,
+          registrationAllowed: false,
+          oidcAvailable: false,
+        });
+        setStep("oidc");
+        return true;
+      }
 
-    // If the server sits behind a reverse-proxy auth gate (Cloudflare Access,
-    // Authelia, …), API endpoints return the proxy's HTML login page rather
-    // than JSON — a native form can't work. Send the user to the browser-based
-    // external sign-in instead.
-    if (await isReverseProxyAuthGate()) {
+      // Semantic transport validation already proved the public Termix API.
+      // OIDC is optional UI metadata and cannot make an unreachable server pass.
+      const oidcConfig = await getOIDCConfig().catch(() => null);
+      const setupRequired = !!health.authCapabilities.setupRequired;
       setCaps({
-        setupRequired: false,
-        passwordLoginAllowed: false,
-        registrationAllowed: false,
-        oidcAvailable: false,
+        setupRequired,
+        passwordLoginAllowed:
+          health.authCapabilities.passwordLoginAllowed !== false,
+        registrationAllowed: !!health.authCapabilities.registrationAllowed,
+        oidcAvailable: !!oidcConfig?.client_id,
       });
-      setStep("oidc");
+      setStep(setupRequired ? "signup" : "login");
       return true;
-    }
+    },
+    [],
+  );
 
-    const [setupRes, pwRes, regRes, oidcRes] = await Promise.allSettled([
-      getSetupRequired(),
-      getPasswordLoginAllowed(),
-      getRegistrationAllowed(),
-      getOIDCConfig(),
-    ]);
-
-    // If every probe failed, the server is unreachable — surface that rather
-    // than rendering an empty login form.
-    if (
-      setupRes.status === "rejected" &&
-      pwRes.status === "rejected" &&
-      regRes.status === "rejected" &&
-      oidcRes.status === "rejected"
-    ) {
-      return false;
-    }
-
-    const setupRequired =
-      setupRes.status === "fulfilled" && !!setupRes.value?.setup_required;
-    const passwordLoginAllowed =
-      pwRes.status === "fulfilled" ? pwRes.value?.allowed !== false : true;
-    const registrationAllowed =
-      regRes.status === "fulfilled" && !!regRes.value?.allowed;
-    const oidcAvailable =
-      oidcRes.status === "fulfilled" && !!oidcRes.value?.client_id;
-
-    setCaps({
-      setupRequired,
-      passwordLoginAllowed,
-      registrationAllowed,
-      oidcAvailable,
-    });
-
-    setStep(setupRequired ? "signup" : "login");
-    return true;
-  }, []);
+  /** Validate the published transport, then derive sign-in affordances. */
+  const probeServer = useCallback(async (): Promise<boolean> => {
+    const runtimeUrl = getCurrentServerUrl();
+    if (!runtimeUrl) return false;
+    const health = await probeServerTransport(runtimeUrl, { token: null });
+    return advanceFromTransportHealth(health);
+  }, [advanceFromTransportHealth]);
 
   const handleConnect = async () => {
     const url = serverUrl.trim().replace(/\/$/, "");
@@ -234,76 +210,34 @@ export default function AuthFlow() {
     }
 
     setBusy(true);
+    setAuthenticated(false);
     try {
-      // Reset the session before connecting to a (possibly different) server:
-      // clears the JWT and the reverse-proxy cookie/session so a fresh proxy
-      // login is shown and a subsequent sign-in can't resolve to the old account.
+      // The new origin is only persisted after the selected candidate proves it
+      // is Termix. Clear the old login immediately, but retain the old server mode
+      // transactionally if this candidate fails.
       await clearSession();
       clearCachedUserId();
 
-      let transportUrl = url;
-      let displayUrl = url;
-      let viaTailscale = false;
-
-      if (useTailscale) {
-        await saveTailscaleSettings({
-          enabled: true,
-          authKey: tailscaleAuthKey,
-          hostname: tailscaleHostname,
-        });
-        const connected = await connectServerViaTailscale({
-          serverUrl: url,
-          authKey: tailscaleAuthKey,
-          hostname: tailscaleHostname,
-          ephemeral: true,
-        });
-        transportUrl = connected.transportUrl;
-        displayUrl = connected.displayUrl;
-        viaTailscale = true;
-      } else {
-        // Keep any previously saved auth key so cold-start can still offer TS,
-        // but mark TS as not preferred for this save.
-        await saveTailscaleSettings({
-          enabled: false,
-          authKey: tailscaleAuthKey,
-          hostname: tailscaleHostname,
-        });
-        // Drop any previous userspace node so direct mode is clean.
-        try {
-          await shutdownTailscale();
-        } catch {
-          // optional
-        }
-      }
-
-      // Persist the user-facing URL on disk. Runtime transport (localhost forward)
-      // is applied in memory only — otherwise Hosts re-init would treat a dead
-      // 127.0.0.1 port as the server and hang after login.
-      const saved = await saveServerConfig(
-        {
-          serverUrl: displayUrl,
-          displayUrl,
-          viaTailscale,
-          lastUpdated: new Date().toISOString(),
-        },
-        {
-          runtimeUrl: viaTailscale ? transportUrl : undefined,
-        },
-      );
-      if (!saved) {
-        throw new Error(
-          "Could not save the server address on this device. Please try again.",
-        );
-      }
-      setSelectedServer({ name: "Server", ip: displayUrl });
-
-      const ok = await probeServer();
-      if (!ok) {
+      const result = await connectServerTransport({
+        serverUrl: url,
+        mode: useTailscale ? "tailscale" : "direct",
+        tailscaleAuthKey,
+        tailscaleHostname,
+      });
+      if (!result.ok) {
         toast.error(
-          viaTailscale
-            ? "Could not reach that server over Tailscale. Check auth key, ACL, and subnet routes."
-            : "Could not reach that server",
+          result.error ||
+            (useTailscale
+              ? "Could not reach that server over Tailscale. Check auth key, ACL, and subnet routes."
+              : "Could not reach that server"),
         );
+        return;
+      }
+
+      setSelectedServer({ name: "Server", ip: url });
+      const advanced = await advanceFromTransportHealth(result.health);
+      if (!advanced) {
+        toast.error("Could not reach a compatible Termix server");
       }
     } catch (e: any) {
       toast.error(errMessage(e, "Could not reach that server"));
@@ -1266,53 +1200,17 @@ function OidcStep({
           authStartedRef.current = false;
           return;
         }
-        await initializeServerConfig({ rehydrateTailscale: false });
-
-        // Confirm the token, tolerating transient gateway hiccups (502 / brief
-        // network blips from the reverse proxy). A real 401 means the token is
-        // bad; a non-user payload (e.g. the proxy's HTML login page) means the
-        // native request isn't reaching Termix — surface that rather than
-        // pretending we're signed in.
-        let confirmed = false;
-        for (let attempt = 0; attempt < 3 && !confirmed; attempt++) {
-          try {
-            const me = await getUserInfo();
-            if (me?.username) {
-              confirmed = true;
-              break;
-            }
-            // Got a response, but not a Termix user object.
-            await new Promise((r) => setTimeout(r, 600));
-          } catch (e: any) {
-            if (isUnauthorizedError(e)) {
-              await AsyncStorage.removeItem("jwt");
-              Alert.alert(
-                "Sign in failed",
-                "The server rejected the session token. Please try again.",
-              );
-              authStartedRef.current = false;
-              return;
-            }
-            // Transient (502/HTML/network) — wait briefly and retry.
-            await new Promise((r) => setTimeout(r, 600));
-          }
-        }
-
-        if (!confirmed) {
-          await AsyncStorage.removeItem("jwt");
-          Alert.alert(
-            "Sign in failed",
-            "Signed in, but the app couldn't reach Termix's API (a reverse proxy may be blocking the request). Please try again.",
-          );
-          authStartedRef.current = false;
-          return;
-        }
-
-        // Proceed even if confirmation didn't succeed: the token is saved and
-        // valid as far as we know; the app's startup will verify it again.
+        // Shared validation requires both /users/me and Hosts. It removes the
+        // token only for an authoritative Termix JSON 401; transient failures keep
+        // the token but do not close the auth flow or mount authenticated screens.
         await onAuthenticated();
-      } catch {
-        Alert.alert("Error", "Could not complete sign-in.");
+      } catch (error) {
+        Alert.alert(
+          "Sign in failed",
+          error instanceof Error
+            ? error.message
+            : "Could not complete sign-in.",
+        );
         authStartedRef.current = false;
       } finally {
         setAuthenticating(false);

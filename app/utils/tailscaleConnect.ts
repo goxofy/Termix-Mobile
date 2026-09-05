@@ -79,11 +79,15 @@ let tailscaleLifecycleQueue: Promise<void> = Promise.resolve();
 let lifecycleGeneration = 0;
 let currentNetworkGeneration = 0;
 let activeLifecycleController: AbortController | null = null;
-let recoveryFlight: {
+type RecoveryFlight = {
   displayUrl: string;
   networkGeneration: number;
+  lifecycleGeneration: number;
+  controller: AbortController;
+  waiters: number;
   promise: Promise<TailscaleTransportResult>;
-} | null = null;
+};
+let recoveryFlight: RecoveryFlight | null = null;
 
 function canceledError(message = "The Tailscale operation was canceled.") {
   return new TailscaleTransportError("operation_canceled", message);
@@ -221,6 +225,9 @@ function withTailscaleLifecycleLock<T>(
 
 function supersedeLifecycleOperation(): number {
   lifecycleGeneration += 1;
+  const staleRecovery = recoveryFlight;
+  recoveryFlight = null;
+  staleRecovery?.controller.abort();
   if (activeLifecycleController) {
     activeLifecycleController.abort();
     cancelTermixTailscaleCurrentOperation();
@@ -242,13 +249,15 @@ function assertCurrentGeneration(
 }
 
 function resolveNetworkGeneration(networkGeneration?: number): number {
-  if (
-    networkGeneration !== undefined &&
-    networkGeneration > currentNetworkGeneration
-  ) {
-    currentNetworkGeneration = networkGeneration;
+  if (networkGeneration === undefined) return currentNetworkGeneration;
+  if (networkGeneration < currentNetworkGeneration) {
+    throw new TailscaleTransportError(
+      "stale_operation",
+      "The network changed before this Tailscale operation could start.",
+    );
   }
-  return networkGeneration ?? currentNetworkGeneration;
+  currentNetworkGeneration = networkGeneration;
+  return networkGeneration;
 }
 
 function asTransportError(error: unknown): TailscaleTransportError {
@@ -685,7 +694,9 @@ export function shutdownTailscale(): Promise<void> {
 
 /** Cancel immediately and let bounded cleanup finish without blocking the caller. */
 export function shutdownTailscaleInBackground(): void {
-  void shutdownTailscale().catch(() => undefined);
+  void Promise.resolve()
+    .then(() => shutdownTailscale())
+    .catch(() => undefined);
 }
 
 /**
@@ -693,14 +704,46 @@ export function shutdownTailscaleInBackground(): void {
  * Late native promises may settle, but cannot republish stale JS state.
  */
 export function invalidateTailscaleLifecycle(networkGeneration: number): void {
+  if (networkGeneration < currentNetworkGeneration) return;
   currentNetworkGeneration = networkGeneration;
   lifecycleGeneration += 1;
+  const staleRecovery = recoveryFlight;
   recoveryFlight = null;
+  staleRecovery?.controller.abort();
   activeLifecycleController?.abort();
   activeLifecycleController = null;
   activeForward = null;
   activeNodeConfig = null;
   cancelTermixTailscaleCurrentOperation();
+}
+
+function waitForRecoveryFlight(
+  flight: RecoveryFlight,
+  signal?: AbortSignal,
+): Promise<TailscaleTransportResult> {
+  if (signal?.aborted) return Promise.reject(canceledError());
+  flight.waiters += 1;
+
+  return new Promise<TailscaleTransportResult>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", handleAbort);
+      flight.waiters = Math.max(0, flight.waiters - 1);
+      callback();
+    };
+    const handleAbort = () => {
+      finish(() => reject(canceledError()));
+      if (flight.waiters === 0) flight.controller.abort();
+    };
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    void flight.promise.then(
+      (result) => finish(() => resolve(result)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }
 
 /**
@@ -715,12 +758,14 @@ export function recoverTailscaleTransport(
   const networkGeneration = resolveNetworkGeneration(options.networkGeneration);
   if (
     recoveryFlight?.displayUrl === parsed.original &&
-    recoveryFlight.networkGeneration === networkGeneration
+    recoveryFlight.networkGeneration === networkGeneration &&
+    recoveryFlight.lifecycleGeneration === lifecycleGeneration
   ) {
-    return recoveryFlight.promise;
+    return waitForRecoveryFlight(recoveryFlight, options.signal);
   }
 
   const generation = supersedeLifecycleOperation();
+  const controller = new AbortController();
   const promise = withTailscaleLifecycleLock(
     async (signal) => {
       try {
@@ -772,22 +817,26 @@ export function recoverTailscaleTransport(
     },
     {
       generation,
-      signal: options.signal,
+      signal: controller.signal,
       timeoutMs: RECOVERY_TIMEOUT_MS,
       label: "Tailscale transport recovery",
     },
   );
 
-  recoveryFlight = {
+  const flight: RecoveryFlight = {
     displayUrl: parsed.original,
     networkGeneration,
+    lifecycleGeneration: generation,
+    controller,
+    waiters: 0,
     promise,
   };
+  recoveryFlight = flight;
   const clearRecoveryFlight = () => {
-    if (recoveryFlight?.promise === promise) recoveryFlight = null;
+    if (recoveryFlight === flight) recoveryFlight = null;
   };
   void promise.then(clearRecoveryFlight, clearRecoveryFlight);
-  return promise;
+  return waitForRecoveryFlight(flight, options.signal);
 }
 
 /** Compatibility wrapper for callers that only need a nullable URL. */
