@@ -31,9 +31,11 @@ export type TunnelManagerHandle = {
 function tunnelKey(
   hostName: string,
   hostId: number,
-  t: { sourcePort: number; endpointHost: string; endpointPort: number },
+  t: { sourcePort: number; endpointHost?: string; endpointPort: number },
 ): string {
-  return `${hostName || hostId}_${t.sourcePort}_${t.endpointHost}_${t.endpointPort}`;
+  // Keep the backend-compatible format for complete records while avoiding an
+  // accidental literal "undefined" when loading a legacy/incomplete tunnel.
+  return `${hostName || hostId}_${t.sourcePort}_${t.endpointHost ?? "unknown"}_${t.endpointPort}`;
 }
 
 export const TunnelManager = forwardRef<TunnelManagerHandle, TunnelSessionProps>(

@@ -32,15 +32,15 @@ export function WarpgateDialog({
     try {
       await Clipboard.setStringAsync(url);
       setCopied(true);
-      showToast("URL copied", "success");
+      showToast.success("URL copied");
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      showToast("Failed to copy", "error");
+      showToast.error("Failed to copy");
     }
   }, [url]);
 
   const handleOpenBrowser = useCallback(() => {
-    if (url) Linking.openURL(url).catch(() => showToast("Could not open browser", "error"));
+    if (url) Linking.openURL(url).catch(() => showToast.error("Could not open browser"));
   }, [url]);
 
   return (

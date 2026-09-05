@@ -356,7 +356,15 @@ export default function Sessions() {
             hiddenInputRef.current?.focus();
           }, 500);
         }
-      } else if (previousAppState === "active") {
+      } else if (
+        (Platform.OS === "ios" &&
+          nextAppState === "background" &&
+          previousAppState !== "background") ||
+        (Platform.OS !== "ios" && previousAppState === "active")
+      ) {
+        // iOS emits inactive for transient system overlays. Only notify terminal
+        // sessions when the app actually enters background; Android keeps its
+        // existing active-to-nonactive behavior.
         sessions.forEach((session) => {
           if (session.type === "terminal") {
             terminalRefs.current[session.id]?.current?.notifyBackgrounded();

@@ -7,7 +7,7 @@ import React, {
   useState,
   type ReactNode,
 } from "react";
-import { AppState, type AppStateStatus } from "react-native";
+import { AppState, Platform, type AppStateStatus } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 import {
@@ -164,6 +164,10 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   const lastAttemptModeRef = useRef<NetworkModeChoice | null>(null);
   const choiceSnapshotRef = useRef<NetworkSnapshot | null>(null);
   const authFlowVisibleRef = useRef(false);
+  // iOS emits inactive for transient system overlays. Only a real background
+  // should pause transport; this flag also carries a network event across a
+  // transient inactive period until the app is active again.
+  const iosRecoveryPendingRef = useRef(false);
 
   const openAuthFlow = useCallback((step: AuthStep = "server") => {
     authFlowVisibleRef.current = true;
@@ -228,7 +232,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const snapshot = latestSnapshotRef.current;
     return (
       mountedRef.current &&
-      appStateRef.current === "active" &&
       !attempt.controller.signal.aborted &&
       activeAttemptRef.current === attempt &&
       appGenerationRef.current === attempt.appGeneration &&
@@ -668,8 +671,19 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       prepareTransportGate();
       setNetworkModeVisible(false);
       choiceSnapshotRef.current = snapshot;
+
+      if (Platform.OS === "ios" && appStateRef.current !== "active") {
+        // A path change can arrive while Control Center/Notification Center is
+        // covering the app. Defer the coordinator until active instead of
+        // attempting to publish UI state underneath the transient overlay.
+        iosRecoveryPendingRef.current = true;
+        return;
+      }
       if (bootCompleteRef.current && appStateRef.current === "active") {
+        iosRecoveryPendingRef.current = false;
         void coordinateTransport(snapshot);
+      } else if (Platform.OS === "ios") {
+        iosRecoveryPendingRef.current = true;
       }
     };
 
@@ -677,6 +691,28 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       appStateRef.current = nextAppState;
       if (!bootCompleteRef.current) return;
 
+      if (Platform.OS === "ios") {
+        if (nextAppState === "inactive") {
+          // iOS uses inactive for short-lived system UI. Do not cancel a live
+          // operation, block requests, or change the loading surface here.
+          return;
+        }
+        if (nextAppState === "background") {
+          iosRecoveryPendingRef.current = true;
+          supersedeCoordinator();
+          prepareTransportGate();
+          setNetworkModeVisible(false);
+          return;
+        }
+        if (nextAppState === "active") {
+          const shouldRecover = iosRecoveryPendingRef.current;
+          iosRecoveryPendingRef.current = false;
+          if (shouldRecover) void refreshSnapshotAndCoordinate();
+        }
+        return;
+      }
+
+      // Preserve Android's existing lifecycle behavior.
       if (nextAppState !== "active") {
         supersedeCoordinator();
         prepareTransportGate();
@@ -720,7 +756,12 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         setIsLoading(false);
 
         if (appStateRef.current === "active") {
+          iosRecoveryPendingRef.current = false;
           await coordinateTransport(latestSnapshotRef.current);
+        } else if (Platform.OS === "ios") {
+          // If boot completed under an inactive/background state, wait for the
+          // first real active callback before starting transport work.
+          iosRecoveryPendingRef.current = true;
         }
 
         void getVersionInfo().catch((error) => {
