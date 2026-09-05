@@ -27,10 +27,9 @@ import { QuickConnect } from "@/app/tabs/hosts/QuickConnect";
 import CredentialListModal from "@/app/tabs/hosts/CredentialListModal";
 import {
   getSSHHosts,
-  getFoldersWithStats,
+  getSSHFolders,
   getAllServerStatuses,
   getServerMetricsById,
-  initializeServerConfig,
   getCurrentServerUrl,
   deleteSSHHost,
   createSSHHost,
@@ -112,6 +111,9 @@ const FILTER_GROUPS: {
 const STORAGE_SORT = "hostSortKey";
 const STORAGE_FILTER = "hostFilterState";
 const STORAGE_EXPANDED = "hostExpandedFolders";
+const FOCUS_FRESHNESS_MS = 60_000;
+
+type FetchMode = "initial" | "silent" | "refresh";
 
 export default function Hosts() {
   const color = useThemeColor();
@@ -140,7 +142,12 @@ export default function Hosts() {
   const [quickConnectOpen, setQuickConnectOpen] = useState(false);
   const [credentialListOpen, setCredentialListOpen] = useState(false);
 
-  const isRefreshingRef = useRef(false);
+  const lastSuccessfulFetchAtRef = useRef(0);
+  const requestGenerationRef = useRef(0);
+  const activeRequestRef = useRef<{
+    generation: number;
+    mode: FetchMode;
+  } | null>(null);
   // Tracks whether the user has manually toggled folders this session, so a data
   // refresh doesn't blow away their expansion choices.
   const expansionInitializedRef = useRef(false);
@@ -174,19 +181,26 @@ export default function Hosts() {
   );
 
   // Fetch CPU/RAM for online hosts. Never throws; failures are ignored so the
-  // list always renders.
+  // list always renders. The generation guard prevents an older metrics request
+  // from replacing data associated with a newer hosts refresh.
   const fetchMetrics = useCallback(
-    async (hostList: SSHHost[], statuses: Record<number, ServerStatus>) => {
+    async (
+      hostList: SSHHost[],
+      statuses: Record<number, ServerStatus>,
+      generation: number,
+    ) => {
       const onlineIds = hostList
         .filter((h) => statuses[h.id]?.status === "online")
         .map((h) => h.id);
       if (onlineIds.length === 0) {
-        setMetrics({});
+        if (generation === requestGenerationRef.current) setMetrics({});
         return;
       }
       const results = await Promise.allSettled(
         onlineIds.map((id) => getServerMetricsById(id)),
       );
+      if (generation !== requestGenerationRef.current) return;
+
       const next: Record<number, HostMetrics> = {};
       results.forEach((res, i) => {
         if (res.status === "fulfilled" && res.value) {
@@ -202,26 +216,35 @@ export default function Hosts() {
   );
 
   const fetchData = useCallback(
-    async (isRefresh = false) => {
-      if (isRefreshingRef.current) return;
-      try {
-        isRefreshingRef.current = true;
-        if (isRefresh) setRefreshing(true);
-        else setLoading(true);
+    async (mode: FetchMode = "initial") => {
+      const activeRequest = activeRequestRef.current;
+      if (
+        activeRequest &&
+        (mode !== "refresh" || activeRequest.mode === "refresh")
+      ) {
+        return;
+      }
 
-        // Do not force a Tailscale re-join here — that tore down the live
-        // localhost forward after login and caused "loading hosts" to hang.
-        // initializeServerConfig reuses a live forward when present.
-        await initializeServerConfig({ rehydrateTailscale: false });
+      const generation = ++requestGenerationRef.current;
+      activeRequestRef.current = { generation, mode };
+
+      try {
+        if (mode === "refresh") setRefreshing(true);
+        if (mode === "initial") setLoading(true);
+
         if (!getCurrentServerUrl()) {
-          toast.error("No server configured. Set one up in Settings.");
+          if (mode !== "silent") {
+            toast.error("No server configured. Set one up in Settings.");
+          }
           return;
         }
 
-        const [hostsResult, statusesResult] = await Promise.allSettled([
-          getSSHHosts(),
-          getAllServerStatuses(),
-        ]);
+        const [hostsResult, statusesResult, foldersResult] =
+          await Promise.allSettled([
+            getSSHHosts(),
+            getAllServerStatuses(),
+            getSSHFolders(),
+          ]);
 
         if (hostsResult.status !== "fulfilled") throw hostsResult.reason;
 
@@ -233,49 +256,57 @@ export default function Hosts() {
             : [];
         const statuses =
           statusesResult.status === "fulfilled" ? statusesResult.value : {};
-
-        let foldersData: any = null;
-        try {
-          foldersData = await getFoldersWithStats();
-        } catch {
-          // folders are optional
-        }
+        const foldersData =
+          foldersResult.status === "fulfilled" ? foldersResult.value : [];
         const colors: Record<string, string | undefined> = {};
         if (Array.isArray(foldersData)) {
-          foldersData.forEach((f: any) => {
-            if (f?.name) colors[f.name] = f.color;
+          foldersData.forEach((folder: any) => {
+            if (folder?.name) colors[folder.name] = folder.color;
           });
         }
+
+        if (generation !== requestGenerationRef.current) return;
 
         setHosts(hostList);
         setFolderColors(colors);
         setServerStatuses(statuses);
+        lastSuccessfulFetchAtRef.current = Date.now();
 
         // Best-effort live metrics for online hosts only.
-        void fetchMetrics(hostList, statuses);
+        void fetchMetrics(hostList, statuses, generation);
       } catch (error: any) {
+        if (generation !== requestGenerationRef.current) return;
+
         const isAuth =
           error?.response?.status === 401 ||
           error?.message?.includes("Authentication required");
-        if (!isAuth) {
+        if (!isAuth && mode !== "silent") {
           toast.error(error?.message || "Failed to load hosts.");
         }
       } finally {
-        setLoading(false);
-        setRefreshing(false);
-        isRefreshingRef.current = false;
+        if (generation === requestGenerationRef.current) {
+          setLoading(false);
+          setRefreshing(false);
+          activeRequestRef.current = null;
+        }
       }
     },
     [fetchMetrics],
   );
 
   const handleRefresh = useCallback(() => {
-    if (!isRefreshingRef.current) fetchData(true);
+    void fetchData("refresh");
   }, [fetchData]);
 
   useFocusEffect(
     useCallback(() => {
-      fetchData();
+      const lastSuccessfulFetchAt = lastSuccessfulFetchAtRef.current;
+      const isFresh =
+        lastSuccessfulFetchAt > 0 &&
+        Date.now() - lastSuccessfulFetchAt < FOCUS_FRESHNESS_MS;
+      if (isFresh) return;
+
+      void fetchData(lastSuccessfulFetchAt > 0 ? "silent" : "initial");
     }, [fetchData]),
   );
 
@@ -365,7 +396,7 @@ export default function Hosts() {
     try {
       await deleteSSHHost(host.id);
       toast.success(`Deleted ${host.name}`);
-      fetchData(true);
+      fetchData("refresh");
     } catch (e: any) {
       toast.error(e?.message || "Failed to delete host");
     }
@@ -414,7 +445,7 @@ export default function Hosts() {
         terminalConfig: host.terminalConfig,
       } as any);
       toast.success(`Cloned ${host.name}`);
-      fetchData(true);
+      fetchData("refresh");
     } catch (e: any) {
       toast.error(e?.message || "Failed to clone host");
     }
@@ -694,7 +725,7 @@ export default function Hosts() {
         onClose={() => setFormOpen(false)}
         onSaved={() => {
           setFormOpen(false);
-          fetchData(true);
+          fetchData("refresh");
         }}
       />
 
