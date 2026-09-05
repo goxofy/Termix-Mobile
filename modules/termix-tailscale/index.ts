@@ -1,4 +1,5 @@
 import { requireOptionalNativeModule } from "expo-modules-core";
+import type { EventSubscription } from "expo-modules-core";
 
 export type TermixTailscaleConfig = {
   authKey: string;
@@ -6,6 +7,14 @@ export type TermixTailscaleConfig = {
   /** Absolute path for tsnet state. Defaults to a native app-support path. */
   stateDir?: string;
   ephemeral?: boolean;
+};
+
+export type NetworkSnapshot = {
+  generation: number;
+  signature: string;
+  status: "online" | "offline" | "unknown";
+  transport: "wifi" | "cellular" | "wired" | "other" | "none";
+  systemVpn: boolean;
 };
 
 export type ForwardProtocol = "http:" | "https:";
@@ -19,6 +28,12 @@ export type ForwardHandle = {
 
 type NativeModule = {
   isAvailable(): boolean;
+  cancelCurrentOperation(): void;
+  getNetworkSnapshot(): Promise<NetworkSnapshot>;
+  addListener(
+    eventName: "onNetworkChanged",
+    listener: (snapshot: NetworkSnapshot) => void,
+  ): EventSubscription;
   configure(options: {
     authKey: string;
     hostname: string;
@@ -58,9 +73,36 @@ type NativeModule = {
 
 const Native = requireOptionalNativeModule<NativeModule>("TermixTailscale");
 
-/** True when the native module is linked (dev client / production build). */
+const UNKNOWN_NETWORK_SNAPSHOT: NetworkSnapshot = {
+  generation: 0,
+  signature: "unknown|none|vpn:0",
+  status: "unknown",
+  transport: "none",
+  systemVpn: false,
+};
+
+/** True when the Go/tsnet library is linked (the network monitor is independent). */
 export function isTermixTailscaleAvailable(): boolean {
   return !!Native?.isAvailable?.();
+}
+
+/** Returns the latest immutable native connectivity snapshot. */
+export async function getTermixTailscaleNetworkSnapshot(): Promise<NetworkSnapshot> {
+  if (!Native) return { ...UNKNOWN_NETWORK_SNAPSHOT };
+  return Native.getNetworkSnapshot();
+}
+
+/** Subscribes to material connectivity/signature changes only. */
+export function addTermixTailscaleNetworkChangeListener(
+  listener: (snapshot: NetworkSnapshot) => void,
+): EventSubscription | null {
+  if (!Native) return null;
+  return Native.addListener("onNetworkChanged", listener);
+}
+
+/** Immediately invalidates/cancels native lifecycle work without waiting. */
+export function cancelTermixTailscaleCurrentOperation(): void {
+  Native?.cancelCurrentOperation();
 }
 
 export async function configureTermixTailscale(

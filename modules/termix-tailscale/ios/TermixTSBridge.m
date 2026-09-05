@@ -20,8 +20,14 @@ static NSString *TermixTSLastErrorString(void) {
   return TermixTS_IsAvailable() == 1;
 }
 
-+ (void)updateDefaultRouteInterface:(NSString *)interfaceName {
-  TermixTS_UpdateDefaultRouteInterface(interfaceName.UTF8String ?: "");
++ (void)updateRoutePolicy:(int)policy
+        physicalInterface:(NSString *)interfaceName
+               generation:(uint64_t)generation {
+  TermixTS_UpdateRoutePolicy(policy, interfaceName.UTF8String ?: "", generation);
+}
+
++ (void)cancelCurrentOperation {
+  TermixTS_CancelCurrentOperation();
 }
 
 + (NSString *)configureWithAuthKey:(NSString *)authKey

@@ -59,6 +59,12 @@ Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeClose(
   return TermixTS_Close();
 }
 
+JNIEXPORT void JNICALL
+Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeCancelCurrentOperation(
+    JNIEnv *env, jobject thiz) {
+  TermixTS_CancelCurrentOperation();
+}
+
 // ---- Forwarding ------------------------------------------------------------
 
 JNIEXPORT jint JNICALL

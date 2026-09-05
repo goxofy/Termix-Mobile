@@ -13,9 +13,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// Whether the real Go archive is linked (false when stub.c is in use).
 + (BOOL)isAvailable;
 
-/// Supply a validated physical default-route interface to Go's netmon.
-+ (void)updateDefaultRouteInterface:(NSString *)interfaceName
-    NS_SWIFT_NAME(updateDefaultRouteInterface(_:));
+/// Publish route policy, validated physical interface, and material generation.
++ (void)updateRoutePolicy:(int)policy
+        physicalInterface:(NSString *)interfaceName
+               generation:(uint64_t)generation;
+
+/// Immediately cancel/invalidate native Up and probe operations. Never waits.
++ (void)cancelCurrentOperation;
 
 /// nil on success, error message on failure.
 + (NSString * _Nullable)configureWithAuthKey:(NSString *)authKey

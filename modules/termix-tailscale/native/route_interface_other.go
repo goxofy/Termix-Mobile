@@ -2,4 +2,4 @@
 
 package main
 
-func updateDefaultRouteInterface(string) {}
+func applyRoutePolicy(routePolicy, string) error { return nil }

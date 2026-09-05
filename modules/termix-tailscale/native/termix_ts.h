@@ -11,8 +11,19 @@ extern "C" {
 // 1 when the real Go/tsnet implementation is linked; 0 for the fallback stub.
 int TermixTS_IsAvailable(void);
 
-// Provide the current physical default-route interface on iOS. Empty hints are ignored.
-void TermixTS_UpdateDefaultRouteInterface(const char *ifName);
+// Route policies published by the iOS NWPathMonitor.
+#define TERMIX_TS_ROUTE_UNAVAILABLE 0
+#define TERMIX_TS_ROUTE_PHYSICAL 1
+#define TERMIX_TS_ROUTE_SYSTEM_VPN 2
+
+// Publish route policy + physical interface + material network generation.
+// physicalName is required only for TERMIX_TS_ROUTE_PHYSICAL.
+void TermixTS_UpdateRoutePolicy(int policy, const char *physicalName,
+                                unsigned long long routeGeneration);
+
+// Immediately invalidate the current node generation and cancel any starting
+// Up/forward/probe operation. This function never waits for cleanup.
+void TermixTS_CancelCurrentOperation(void);
 
 // Configure before Up. stateDir must be a writable path. Returns 0 on success.
 int TermixTS_Configure(const char *authKey, const char *hostname,

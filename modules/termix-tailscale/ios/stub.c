@@ -7,7 +7,14 @@
 
 int TermixTS_IsAvailable(void) { return 0; }
 
-void TermixTS_UpdateDefaultRouteInterface(const char *ifName) { (void)ifName; }
+void TermixTS_UpdateRoutePolicy(int policy, const char *physicalName,
+                                unsigned long long routeGeneration) {
+  (void)policy;
+  (void)physicalName;
+  (void)routeGeneration;
+}
+
+void TermixTS_CancelCurrentOperation(void) {}
 
 static char *dup_err(const char *msg) {
   size_t n = strlen(msg) + 1;

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,6 +26,7 @@ import (
 	"time"
 	"unsafe"
 
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tsnet"
 )
 
@@ -35,30 +37,116 @@ func TermixTS_IsAvailable() C.int {
 	return 1
 }
 
-//export TermixTS_UpdateDefaultRouteInterface
-func TermixTS_UpdateDefaultRouteInterface(ifName *C.char) {
-	if ifName == nil {
-		return
+type routePolicy uint8
+
+const (
+	routePolicyUnavailable routePolicy = iota
+	routePolicyPhysical
+	routePolicySystemVPN
+)
+
+type routeSnapshot struct {
+	policy       routePolicy
+	physicalName string
+	generation   uint64
+}
+
+//export TermixTS_UpdateRoutePolicy
+func TermixTS_UpdateRoutePolicy(policy C.int, physicalName *C.char, routeGeneration C.ulonglong) {
+	name := ""
+	if physicalName != nil {
+		name = C.GoString(physicalName)
 	}
-	updateDefaultRouteInterface(C.GoString(ifName))
+	updateRoutePolicy(routePolicy(policy), name, uint64(routeGeneration))
+}
+
+//export TermixTS_CancelCurrentOperation
+func TermixTS_CancelCurrentOperation() {
+	cancelCurrentOperation()
+}
+
+type nodeConfig struct {
+	authKey   string
+	hostname  string
+	stateDir  string
+	ephemeral bool
+}
+
+type tailscaleNode interface {
+	Up(context.Context) error
+	Close() error
+	Dial(context.Context, string, string) (net.Conn, error)
+	BackendRunning(context.Context) bool
+	TailscaleIPs() (netip.Addr, netip.Addr)
+}
+
+type tsnetNode struct {
+	server *tsnet.Server
+}
+
+func (n *tsnetNode) Up(ctx context.Context) error {
+	_, err := n.server.Up(ctx)
+	return err
+}
+
+func (n *tsnetNode) Close() error {
+	return n.server.Close()
+}
+
+func (n *tsnetNode) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	return n.server.Dial(ctx, network, address)
+}
+
+func (n *tsnetNode) BackendRunning(ctx context.Context) bool {
+	client, err := n.server.LocalClient()
+	if err != nil {
+		return false
+	}
+	status, err := client.StatusWithoutPeers(ctx)
+	return err == nil && status != nil && strings.EqualFold(status.BackendState, "Running")
+}
+
+func (n *tsnetNode) TailscaleIPs() (netip.Addr, netip.Addr) {
+	return n.server.TailscaleIPs()
+}
+
+func newTSNetServer(config nodeConfig) *tsnet.Server {
+	s := &tsnet.Server{
+		Hostname:  config.hostname,
+		AuthKey:   config.authKey,
+		Dir:       config.stateDir,
+		Ephemeral: config.ephemeral,
+	}
+	if config.ephemeral {
+		// Ephemeral nodes must never recover an identity from tailscaled.state.
+		// Keeping the state in memory also guarantees every process launch uses
+		// the supplied reusable auth key instead of silently entering NeedsLogin.
+		s.Store = new(mem.Store)
+	}
+	return s
+}
+
+var nodeFactory = func(config nodeConfig) tailscaleNode {
+	return &tsnetNode{server: newTSNetServer(config)}
 }
 
 type forwardEntry struct {
-	protocol    string
-	remoteHost  string
-	remotePort  int
-	localPort   int
-	server      *tsnet.Server
-	generation  uint64
-	listener    net.Listener
-	cancel      context.CancelFunc
-	requestCtx  context.Context
-	proxy       *http.Server
-	transport   *http.Transport
-	connections map[net.Conn]struct{}
-	connMu      sync.Mutex
-	stopOnce    sync.Once
-	stopErr     error
+	protocol        string
+	remoteHost      string
+	remotePort      int
+	localPort       int
+	server          tailscaleNode
+	nodeGeneration  uint64
+	routeGeneration uint64
+	listener        net.Listener
+	cancel          context.CancelFunc
+	requestCtx      context.Context
+	proxy           *http.Server
+	transport       *http.Transport
+	connections     map[net.Conn]struct{}
+	connMu          sync.Mutex
+	stopOnce        sync.Once
+	stopErr         error
 }
 
 // forwardListener wraps accepted connections so hijacked WebSockets can remove
@@ -111,34 +199,60 @@ const (
 	nodeClosing
 )
 
+type upOperation struct {
+	node           tailscaleNode
+	nodeGeneration uint64
+	route          routeSnapshot
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
+	err            error
+}
+
+type cleanupTask struct {
+	operation   *upOperation
+	node        tailscaleNode
+	done        chan struct{}
+	clearConfig bool // protected by mu
+	err         error
+}
+
 var (
-	// mu protects the tsnet lifecycle and configuration. It is never held while
-	// calling tsnet.Server.Up or Close because both may block on I/O.
-	mu                sync.Mutex
-	lifecycleCond     = sync.NewCond(&mu)
-	configureMu       sync.Mutex
-	errorMu           sync.Mutex
-	forwardMu         sync.Mutex
-	server            *tsnet.Server
-	startingServer    *tsnet.Server
-	started           bool
-	state             = nodeIdle
-	upCancel          context.CancelFunc
-	upDone            chan struct{}
-	generation        uint64
-	forwardGeneration uint64
-	forwards          = map[string]*forwardEntry{}
-	lastError         string
-	configured        bool
+	// mu protects lifecycle, configuration, route generation, and cancelable
+	// operation registration. It is never held while calling a tsnet method.
+	mu                    sync.Mutex
+	errorMu               sync.Mutex
+	forwardMu             sync.Mutex
+	routeApplyMu          sync.Mutex
+	server                tailscaleNode
+	serverGeneration      uint64
+	serverRouteGeneration uint64
+	state                 = nodeIdle
+	startingOperation     *upOperation
+	activeCleanup         *cleanupTask
+	generation            uint64
+	forwardGeneration     uint64
+	forwards              = map[string]*forwardEntry{}
+	lastError             string
+	configured            bool
+	currentRoute          routeSnapshot
+	nextCancelableID      uint64
+	operationCancels      = map[uint64]context.CancelFunc{}
 
 	cfgAuthKey   string
 	cfgHostname  string
 	cfgStateDir  string
 	cfgEphemeral bool
+
+	// Variables rather than constants make the hard bounds injectable in tests.
+	upCallDeadline            = 90 * time.Second
+	closeWaitBudget           = 3 * time.Second
+	startForwardProbeTimeout  = 10 * time.Second
+	forwardHealthProbeTimeout = 5 * time.Second
 )
 
-// clearConfigLocked forgets credentials and state-directory ownership after a
-// native close. The caller must hold mu.
+// clearConfigLocked forgets credentials and state-directory ownership after an
+// explicit native close. The caller must hold mu.
 func clearConfigLocked() {
 	configured = false
 	cfgAuthKey = ""
@@ -167,169 +281,378 @@ func forwardKey(protocol, host string, remotePort, localPort int) string {
 	)
 }
 
-//export TermixTS_Configure
-func TermixTS_Configure(authKey, hostname, stateDir *C.char, ephemeral C.int) C.int {
-	auth := C.GoString(authKey)
-	host := strings.TrimSpace(C.GoString(hostname))
-	dir := strings.TrimSpace(C.GoString(stateDir))
-	if host == "" {
-		host = "termix-mobile"
+func configureNode(config nodeConfig) error {
+	config.hostname = strings.TrimSpace(config.hostname)
+	config.stateDir = strings.TrimSpace(config.stateDir)
+	if config.hostname == "" {
+		config.hostname = "termix-mobile"
 	}
-	if dir == "" {
-		setErr(fmt.Errorf("state directory is required"))
-		return -1
+	if config.stateDir == "" {
+		return fmt.Errorf("state directory is required")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		setErr(fmt.Errorf("create state dir: %w", err))
-		return -1
+	if err := os.MkdirAll(config.stateDir, 0o700); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
 	}
-
-	configureMu.Lock()
-	defer configureMu.Unlock()
 
 	mu.Lock()
 	defer mu.Unlock()
-	for state == nodeClosing {
-		lifecycleCond.Wait()
+	if state == nodeClosing || activeCleanup != nil {
+		return fmt.Errorf("tailscale cleanup still in progress; retry configure shortly")
 	}
-	if state != nodeIdle || started {
-		setErr(fmt.Errorf("already started; call TermixTS_Close before reconfigure"))
-		return -1
+	if state != nodeIdle || server != nil || startingOperation != nil {
+		return fmt.Errorf("already started; call TermixTS_Close before reconfigure")
 	}
 
-	cfgAuthKey = auth
-	cfgHostname = host
-	cfgStateDir = dir
-	cfgEphemeral = ephemeral != 0
+	cfgAuthKey = config.authKey
+	cfgHostname = config.hostname
+	cfgStateDir = config.stateDir
+	cfgEphemeral = config.ephemeral
 	configured = true
 
 	// On Android, $XDG_CACHE_HOME / $HOME are unset, so logpolicy's
-	// os.UserCacheDir() fails and tsnet panics ("no safe place found to store
-	// log state"). Point XDG_CACHE_HOME at our writable state directory parent.
-	// iOS uses the darwin branch of UserCacheDir and is unaffected.
+	// os.UserCacheDir() fails and tsnet panics. Point it at a writable parent.
 	if runtime.GOOS == "android" {
 		cacheParent := filepath.Dir(cfgStateDir)
 		if err := os.MkdirAll(cacheParent, 0o700); err == nil {
 			_ = os.Setenv("XDG_CACHE_HOME", cacheParent)
 		}
 	}
+	return nil
+}
 
+//export TermixTS_Configure
+func TermixTS_Configure(authKey, hostname, stateDir *C.char, ephemeral C.int) C.int {
+	err := configureNode(nodeConfig{
+		authKey:   C.GoString(authKey),
+		hostname:  C.GoString(hostname),
+		stateDir:  C.GoString(stateDir),
+		ephemeral: ephemeral != 0,
+	})
+	if err != nil {
+		setErr(err)
+		return -1
+	}
 	setErr(nil)
 	return 0
 }
 
+func updateRoutePolicy(policy routePolicy, physicalName string, routeGeneration uint64) {
+	physicalName = strings.TrimSpace(physicalName)
+	if policy == routePolicyPhysical && !validPhysicalInterfaceName(physicalName) {
+		policy = routePolicyUnavailable
+		physicalName = ""
+	}
+	if policy != routePolicyPhysical {
+		physicalName = ""
+	}
+	if policy > routePolicySystemVPN {
+		policy = routePolicyUnavailable
+	}
+
+	mu.Lock()
+	if routeGeneration < currentRoute.generation {
+		mu.Unlock()
+		return
+	}
+	currentRoute = routeSnapshot{
+		policy:       policy,
+		physicalName: physicalName,
+		generation:   routeGeneration,
+	}
+	snapshot := currentRoute
+	mu.Unlock()
+
+	// Apply promptly as well as at every construction/dial boundary. The helper
+	// rechecks generation under routeApplyMu so an older publication cannot win.
+	_ = applyRouteSnapshot(snapshot)
+}
+
+func validPhysicalInterfaceName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name != "" && !strings.HasPrefix(name, "utun") && name != "lo" && name != "lo0"
+}
+
+func applyRouteSnapshot(snapshot routeSnapshot) error {
+	routeApplyMu.Lock()
+	defer routeApplyMu.Unlock()
+
+	mu.Lock()
+	isCurrent := currentRoute == snapshot
+	mu.Unlock()
+	if !isCurrent {
+		return fmt.Errorf("network route changed while applying policy")
+	}
+	return applyRoutePolicy(snapshot.policy, snapshot.physicalName)
+}
+
+func currentRouteSnapshot() routeSnapshot {
+	mu.Lock()
+	defer mu.Unlock()
+	return currentRoute
+}
+
+func runUpOperation(operation *upOperation) {
+	operation.err = operation.node.Up(operation.ctx)
+	close(operation.done)
+}
+
+func beginCleanupLocked(operation *upOperation, node tailscaleNode, clearConfig bool) *cleanupTask {
+	if activeCleanup != nil {
+		if clearConfig {
+			activeCleanup.clearConfig = true
+		}
+		return activeCleanup
+	}
+	state = nodeClosing
+	task := &cleanupTask{
+		operation:   operation,
+		node:        node,
+		done:        make(chan struct{}),
+		clearConfig: clearConfig,
+	}
+	activeCleanup = task
+	go finalizeCleanup(task)
+	return task
+}
+
+func finalizeCleanup(task *cleanupTask) {
+	if task.operation != nil {
+		<-task.operation.done
+	}
+	if task.node != nil {
+		task.err = task.node.Close()
+	}
+
+	mu.Lock()
+	if activeCleanup == task {
+		if startingOperation == task.operation {
+			startingOperation = nil
+		}
+		if server == task.node {
+			server = nil
+		}
+		serverGeneration = 0
+		serverRouteGeneration = 0
+		state = nodeIdle
+		if task.clearConfig {
+			clearConfigLocked()
+		}
+		activeCleanup = nil
+		close(task.done)
+	}
+	mu.Unlock()
+}
+
+func ensureUpCleanup(operation *upOperation, clearConfig bool) *cleanupTask {
+	mu.Lock()
+	defer mu.Unlock()
+	if activeCleanup != nil {
+		if clearConfig {
+			activeCleanup.clearConfig = true
+		}
+		return activeCleanup
+	}
+	if startingOperation != operation {
+		return nil
+	}
+	return beginCleanupLocked(operation, operation.node, clearConfig)
+}
+
+func upNode() error {
+	mu.Lock()
+	switch state {
+	case nodeRunning:
+		if server != nil && serverGeneration == generation && serverRouteGeneration == currentRoute.generation {
+			mu.Unlock()
+			return nil
+		}
+		mu.Unlock()
+		return fmt.Errorf("tailscale node is stale after cancellation or network change; call Close before Up")
+	case nodeStarting:
+		mu.Unlock()
+		return fmt.Errorf("tailscale up is already in progress")
+	case nodeClosing:
+		mu.Unlock()
+		return fmt.Errorf("tailscale cleanup still in progress; retry Up shortly")
+	}
+	if !configured || cfgStateDir == "" {
+		mu.Unlock()
+		return fmt.Errorf("tailscale is not configured")
+	}
+	config := nodeConfig{
+		authKey:   cfgAuthKey,
+		hostname:  cfgHostname,
+		stateDir:  cfgStateDir,
+		ephemeral: cfgEphemeral,
+	}
+	route := currentRoute
+	mu.Unlock()
+
+	// netns policy is process-wide and must be established before tsnet creates
+	// its live netmon. A later hint cannot repair that monitor.
+	if err := applyRouteSnapshot(route); err != nil {
+		return fmt.Errorf("apply network route before tailscale up: %w", err)
+	}
+	node := nodeFactory(config)
+	ctx, cancel := context.WithTimeout(context.Background(), upCallDeadline)
+	operation := &upOperation{
+		node:   node,
+		route:  route,
+		ctx:    ctx,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	mu.Lock()
+	if state != nodeIdle || activeCleanup != nil || currentRoute != route {
+		mu.Unlock()
+		cancel()
+		_ = node.Close()
+		return fmt.Errorf("network or tailscale lifecycle changed before Up could start")
+	}
+	generation++
+	operation.nodeGeneration = generation
+	state = nodeStarting
+	startingOperation = operation
+	mu.Unlock()
+
+	// Android 11+ blocks the netlink enumeration used by net.Interfaces.
+	// Register the ioctl-backed getter before netmon is created inside Up.
+	registerAndroidInterfaceGetter()
+	go runUpOperation(operation)
+
+	select {
+	case <-operation.done:
+		cancel()
+		if operation.err != nil {
+			ensureUpCleanup(operation, false)
+			return fmt.Errorf("tailscale up: %w", operation.err)
+		}
+		// Reapply after startup, then verify both lifecycle and route generations
+		// before publishing this node.
+		if err := applyRouteSnapshot(operation.route); err != nil {
+			ensureUpCleanup(operation, false)
+			return fmt.Errorf("tailscale route changed during Up: %w", err)
+		}
+
+		mu.Lock()
+		publish := state == nodeStarting && startingOperation == operation &&
+			generation == operation.nodeGeneration && currentRoute == operation.route
+		if publish {
+			server = operation.node
+			serverGeneration = operation.nodeGeneration
+			serverRouteGeneration = operation.route.generation
+			startingOperation = nil
+			state = nodeRunning
+		}
+		mu.Unlock()
+		if publish {
+			return nil
+		}
+		ensureUpCleanup(operation, false)
+		return fmt.Errorf("tailscale up was superseded by cancellation or network change; cleanup continues in background")
+	case <-ctx.Done():
+		// Do not wait for Server.Up: older networking stacks can ignore context
+		// cancellation while rebuilding routes. The finalizer owns the candidate
+		// until Up returns and Close completes.
+		ensureUpCleanup(operation, false)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("tailscale up exceeded %s; cleanup continues in background", upCallDeadline)
+		}
+		return fmt.Errorf("tailscale up canceled; cleanup continues in background")
+	}
+}
+
 //export TermixTS_Up
 func TermixTS_Up() C.int {
-	for {
-		mu.Lock()
-		switch state {
-		case nodeRunning:
-			if started && server != nil {
-				mu.Unlock()
-				setErr(nil)
-				return 0
-			}
-			state = nodeIdle
-		case nodeStarting:
-			done := upDone
-			mu.Unlock()
-			if done != nil {
-				<-done
-			}
-			continue
-		case nodeClosing:
-			lifecycleCond.Wait()
-			mu.Unlock()
-			continue
-		}
-
-		if !configured || cfgStateDir == "" {
-			mu.Unlock()
-			setErr(fmt.Errorf("tailscale is not configured"))
-			return -1
-		}
-
-		s := &tsnet.Server{
-			Hostname:  cfgHostname,
-			AuthKey:   cfgAuthKey,
-			Dir:       cfgStateDir,
-			Ephemeral: cfgEphemeral,
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		done := make(chan struct{})
-		generation++
-		myGeneration := generation
-		state = nodeStarting
-		startingServer = s
-		upCancel = cancel
-		upDone = done
-		mu.Unlock()
-
-		// Android 11+ blocks the netlink enumeration used by net.Interfaces.
-		// Register the ioctl-backed getter before netmon is created inside Up.
-		registerAndroidInterfaceGetter()
-
-		_, upErr := s.Up(ctx)
-		cancel()
-		var candidateCloseErr error
-		if upErr != nil {
-			candidateCloseErr = s.Close()
-		}
-
-		mu.Lock()
-		externallyClosing := state == nodeClosing && generation != myGeneration
-		publish := upErr == nil && state == nodeStarting &&
-			generation == myGeneration && startingServer == s
-		if publish {
-			server = s
-			started = true
-			state = nodeRunning
-		} else {
-			server = nil
-			started = false
-			// A concurrent Close owns nodeClosing until teardown is complete. For
-			// an ordinary Up failure, reserve the state directory while this
-			// goroutine closes its candidate server.
-			if !externallyClosing {
-				state = nodeClosing
-			}
-		}
-		mu.Unlock()
-
-		if !publish && upErr == nil {
-			candidateCloseErr = s.Close()
-		}
-
-		mu.Lock()
-		if startingServer == s {
-			startingServer = nil
-		}
-		if upDone == done {
-			upCancel = nil
-			close(done)
-			upDone = nil
-		}
-		if !publish && !externallyClosing {
-			state = nodeIdle
-		}
-		lifecycleCond.Broadcast()
-		mu.Unlock()
-
-		if publish {
-			setErr(nil)
-			return 0
-		}
-		var resultErr error
-		if upErr == nil {
-			resultErr = fmt.Errorf("tailscale up canceled")
-		} else {
-			resultErr = fmt.Errorf("tailscale up: %w", upErr)
-		}
-		if candidateCloseErr != nil {
-			resultErr = fmt.Errorf("%w; close candidate: %v", resultErr, candidateCloseErr)
-		}
-		setErr(resultErr)
+	if err := upNode(); err != nil {
+		setErr(err)
 		return -1
+	}
+	setErr(nil)
+	return 0
+}
+
+func cancelCurrentOperation() {
+	mu.Lock()
+	generation++
+	cancels := make([]context.CancelFunc, 0, len(operationCancels)+1)
+	if startingOperation != nil && startingOperation.cancel != nil {
+		cancels = append(cancels, startingOperation.cancel)
+		if state == nodeStarting {
+			beginCleanupLocked(startingOperation, startingOperation.node, false)
+		}
+	}
+	for _, cancel := range operationCancels {
+		cancels = append(cancels, cancel)
+	}
+	mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func registerCancelableOperation(
+	timeout time.Duration,
+	node tailscaleNode,
+	nodeGeneration uint64,
+	routeGeneration uint64,
+) (context.Context, func(), bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	mu.Lock()
+	if state != nodeRunning || server != node || generation != nodeGeneration ||
+		serverGeneration != nodeGeneration || currentRoute.generation != routeGeneration ||
+		serverRouteGeneration != routeGeneration {
+		mu.Unlock()
+		cancel()
+		return nil, nil, false
+	}
+	nextCancelableID++
+	id := nextCancelableID
+	operationCancels[id] = cancel
+	mu.Unlock()
+
+	release := func() {
+		cancel()
+		mu.Lock()
+		delete(operationCancels, id)
+		mu.Unlock()
+	}
+	return ctx, release, true
+}
+
+func runningNodeSnapshot() (tailscaleNode, uint64, routeSnapshot, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	if state != nodeRunning || server == nil || serverGeneration != generation ||
+		serverRouteGeneration != currentRoute.generation {
+		return nil, 0, routeSnapshot{}, false
+	}
+	return server, serverGeneration, currentRoute, true
+}
+
+func routeAwareDialContext(
+	node tailscaleNode,
+	nodeGeneration uint64,
+	routeGeneration uint64,
+) forwardDialContext {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		mu.Lock()
+		current := currentRoute
+		valid := state == nodeRunning && server == node && generation == nodeGeneration &&
+			serverGeneration == nodeGeneration && current.generation == routeGeneration &&
+			serverRouteGeneration == routeGeneration
+		mu.Unlock()
+		if !valid {
+			return nil, fmt.Errorf("tailscale node is stale after a network change")
+		}
+		if err := applyRouteSnapshot(current); err != nil {
+			return nil, fmt.Errorf("apply network route before tailscale dial: %w", err)
+		}
+		if !isNodeCurrent(node, nodeGeneration, routeGeneration) {
+			return nil, fmt.Errorf("network changed before tailscale dial")
+		}
+		return node.Dial(ctx, network, address)
 	}
 }
 
@@ -347,15 +670,15 @@ func TermixTS_StartForward(protocol *C.char, remoteHost *C.char, remotePort C.in
 		return -1
 	}
 
-	mu.Lock()
-	if state != nodeRunning || !started || server == nil {
-		mu.Unlock()
-		setErr(fmt.Errorf("tailscale is not connected; call Up first"))
+	node, nodeGeneration, route, ok := runningNodeSnapshot()
+	if !ok {
+		setErr(fmt.Errorf("tailscale is not connected or is stale; call Up first"))
 		return -1
 	}
-	s := server
-	myGeneration := generation
-	mu.Unlock()
+	if err := applyRouteSnapshot(route); err != nil {
+		setErr(fmt.Errorf("apply network route before forward probe: %w", err))
+		return -1
+	}
 
 	forwardMu.Lock()
 	myForwardGeneration := forwardGeneration
@@ -367,38 +690,48 @@ func TermixTS_StartForward(protocol *C.char, remoteHost *C.char, remotePort C.in
 		return -1
 	}
 
-	if !isCurrentRunningServer(s, myGeneration) {
+	probeCtx, releaseProbe, registered := registerCancelableOperation(
+		startForwardProbeTimeout,
+		node,
+		nodeGeneration,
+		route.generation,
+	)
+	if !registered {
 		_ = ln.Close()
-		setErr(fmt.Errorf("tailscale is closing; forward was not started"))
+		setErr(fmt.Errorf("network changed before forward probe could start"))
 		return -1
 	}
-	if err := probeForwardTarget(s.Dial, host, rport); err != nil {
+	dialContext := routeAwareDialContext(node, nodeGeneration, route.generation)
+	err = probeForwardTargetWithContext(probeCtx, dialContext, host, rport)
+	releaseProbe()
+	if err != nil {
 		_ = ln.Close()
 		setErr(err)
 		return -1
 	}
-	if !isCurrentRunningServer(s, myGeneration) {
+	if err := applyRouteSnapshot(route); err != nil {
 		_ = ln.Close()
-		setErr(fmt.Errorf("tailscale is closing; forward was not started"))
+		setErr(fmt.Errorf("network changed after forward probe: %w", err))
 		return -1
 	}
 
 	localPort := ln.Addr().(*net.TCPAddr).Port
 	requestCtx, cancel := context.WithCancel(context.Background())
 	entry := &forwardEntry{
-		protocol:    scheme,
-		remoteHost:  host,
-		remotePort:  rport,
-		localPort:   localPort,
-		server:      s,
-		generation:  myGeneration,
-		cancel:      cancel,
-		requestCtx:  requestCtx,
-		connections: make(map[net.Conn]struct{}),
+		protocol:        scheme,
+		remoteHost:      host,
+		remotePort:      rport,
+		localPort:       localPort,
+		server:          node,
+		nodeGeneration:  nodeGeneration,
+		routeGeneration: route.generation,
+		cancel:          cancel,
+		requestCtx:      requestCtx,
+		connections:     make(map[net.Conn]struct{}),
 	}
 	entry.listener = &forwardListener{Listener: ln, entry: entry}
 
-	proxy, err := newForwardProxy(scheme, host, rport, localPort, s.Dial)
+	proxy, err := newForwardProxy(scheme, host, rport, localPort, dialContext)
 	if err != nil {
 		_ = ln.Close()
 		cancel()
@@ -414,20 +747,21 @@ func TermixTS_StartForward(protocol *C.char, remoteHost *C.char, remotePort C.in
 	}
 	key := forwardKey(scheme, host, rport, localPort)
 
-	// Serialize publication with Close/StopAll. A close that began after the
-	// initial lifecycle check must not leave a listener behind the old node.
+	// Serialize publication with Close/StopAll. A close or route change that
+	// began after the probe must not leave a listener behind the old node.
 	forwardMu.Lock()
 	mu.Lock()
-	canPublish := state == nodeRunning && server == s && generation == myGeneration &&
-		forwardGeneration == myForwardGeneration
+	canPublish := state == nodeRunning && server == node && generation == nodeGeneration &&
+		serverGeneration == nodeGeneration && currentRoute.generation == route.generation &&
+		serverRouteGeneration == route.generation && forwardGeneration == myForwardGeneration
 	mu.Unlock()
 	if canPublish {
 		forwards[key] = entry
 	}
 	forwardMu.Unlock()
 	if !canPublish {
-		stopEntry(entry)
-		setErr(fmt.Errorf("tailscale is closing; forward was not started"))
+		_ = stopEntry(entry)
+		setErr(fmt.Errorf("network changed; forward was not started"))
 		return -1
 	}
 
@@ -438,7 +772,7 @@ func TermixTS_StartForward(protocol *C.char, remoteHost *C.char, remotePort C.in
 				delete(forwards, key)
 			}
 			forwardMu.Unlock()
-			stopEntry(entry)
+			_ = stopEntry(entry)
 			setErr(fmt.Errorf("serve localhost forward: %w", serveErr))
 		}
 	}()
@@ -458,21 +792,6 @@ func normalizeForwardHost(host string) string {
 	return strings.ToLower(host)
 }
 
-func isCurrentRunningServer(s *tsnet.Server, candidateGeneration uint64) bool {
-	mu.Lock()
-	defer mu.Unlock()
-	return state == nodeRunning && started && server == s && generation == candidateGeneration
-}
-
-const (
-	// startForwardProbeTimeout bounds the reachability check performed before a
-	// new localhost forward is published.
-	startForwardProbeTimeout = 10 * time.Second
-	// forwardHealthProbeTimeout bounds TermixTS_ProbeForward, which foreground
-	// recovery runs before deciding whether to reuse or rebuild the transport.
-	forwardHealthProbeTimeout = 5 * time.Second
-)
-
 func probeForwardTarget(dialContext forwardDialContext, remoteHost string, remotePort int) error {
 	return probeForwardTargetWithTimeout(dialContext, remoteHost, remotePort, startForwardProbeTimeout)
 }
@@ -485,9 +804,24 @@ func probeForwardTargetWithTimeout(
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return probeForwardTargetWithContext(ctx, dialContext, remoteHost, remotePort)
+}
+
+func probeForwardTargetWithContext(
+	ctx context.Context,
+	dialContext forwardDialContext,
+	remoteHost string,
+	remotePort int,
+) error {
 	address := net.JoinHostPort(remoteHost, strconv.Itoa(remotePort))
 	connection, err := dialContext(ctx, "tcp", address)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return fmt.Errorf("probe Tailscale target %s canceled", address)
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("probe Tailscale target %s timed out", address)
+		}
 		return fmt.Errorf("probe Tailscale target %s: %w", address, err)
 	}
 	_ = connection.Close()
@@ -579,8 +913,10 @@ func TermixTS_IsForwardActive(protocol *C.char, remoteHost *C.char, remotePort C
 	entry, ok := forwards[key]
 	if ok {
 		mu.Lock()
-		ok = state == nodeRunning && started && server == entry.server &&
-			generation == entry.generation
+		ok = state == nodeRunning && server == entry.server &&
+			generation == entry.nodeGeneration && serverGeneration == entry.nodeGeneration &&
+			currentRoute.generation == entry.routeGeneration &&
+			serverRouteGeneration == entry.routeGeneration
 		mu.Unlock()
 	}
 	forwardMu.Unlock()
@@ -602,20 +938,37 @@ func TermixTS_ProbeForward(protocol *C.char, remoteHost *C.char, remotePort C.in
 	forwardMu.Lock()
 	entry, ok := forwards[key]
 	forwardMu.Unlock()
-	if !ok || !isCurrentRunningServer(entry.server, entry.generation) {
+	if !ok {
 		setErr(fmt.Errorf("forward is not active"))
 		return 0
 	}
-
-	// Dial through the node that owns this forward without holding any lock, so
-	// a slow tailnet cannot block Close or StartForward. A bound listener alone
-	// proves nothing after iOS suspension; the target must answer over Tailscale.
-	if err := probeForwardTargetWithTimeout(
-		entry.server.Dial,
-		entry.remoteHost,
-		entry.remotePort,
+	route := currentRouteSnapshot()
+	if route.generation != entry.routeGeneration {
+		setErr(fmt.Errorf("forward is stale after a network change"))
+		return 0
+	}
+	if err := applyRouteSnapshot(route); err != nil {
+		setErr(fmt.Errorf("apply network route before forward probe: %w", err))
+		return 0
+	}
+	ctx, releaseProbe, registered := registerCancelableOperation(
 		forwardHealthProbeTimeout,
-	); err != nil {
+		entry.server,
+		entry.nodeGeneration,
+		entry.routeGeneration,
+	)
+	if !registered {
+		setErr(fmt.Errorf("forward is not active or became stale"))
+		return 0
+	}
+	dialContext := routeAwareDialContext(
+		entry.server,
+		entry.nodeGeneration,
+		entry.routeGeneration,
+	)
+	err = probeForwardTargetWithContext(ctx, dialContext, entry.remoteHost, entry.remotePort)
+	releaseProbe()
+	if err != nil {
 		setErr(err)
 		return 0
 	}
@@ -623,7 +976,8 @@ func TermixTS_ProbeForward(protocol *C.char, remoteHost *C.char, remotePort C.in
 	forwardMu.Lock()
 	stillRegistered := forwards[key] == entry
 	forwardMu.Unlock()
-	if !stillRegistered || !isCurrentRunningServer(entry.server, entry.generation) {
+	_, _, latestRoute, stillRunning := runningNodeSnapshot()
+	if !stillRegistered || !stillRunning || latestRoute.generation != entry.routeGeneration {
 		setErr(fmt.Errorf("forward was replaced during probe"))
 		return 0
 	}
@@ -694,32 +1048,26 @@ func isUnexpectedCloseError(err error) bool {
 	return err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed)
 }
 
+func isNodeCurrent(node tailscaleNode, nodeGeneration, routeGeneration uint64) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return state == nodeRunning && server == node && generation == nodeGeneration &&
+		serverGeneration == nodeGeneration && currentRoute.generation == routeGeneration &&
+		serverRouteGeneration == routeGeneration
+}
+
 //export TermixTS_IsUp
 func TermixTS_IsUp() C.int {
-	mu.Lock()
-	if state != nodeRunning || !started || server == nil {
-		mu.Unlock()
+	node, nodeGeneration, route, ok := runningNodeSnapshot()
+	if !ok {
 		return 0
 	}
-	s := server
-	myGeneration := generation
-	mu.Unlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	client, err := s.LocalClient()
-	if err != nil {
+	if !node.BackendRunning(ctx) {
 		return 0
 	}
-	status, err := client.StatusWithoutPeers(ctx)
-	if err != nil || status == nil || !strings.EqualFold(status.BackendState, "Running") {
-		return 0
-	}
-
-	mu.Lock()
-	stillRunning := state == nodeRunning && started && server == s && generation == myGeneration
-	mu.Unlock()
-	if stillRunning {
+	if isNodeCurrent(node, nodeGeneration, route.generation) {
 		return 1
 	}
 	return 0
@@ -727,16 +1075,14 @@ func TermixTS_IsUp() C.int {
 
 //export TermixTS_GetIPs
 func TermixTS_GetIPs() *C.char {
-	// Keep the server pointer protected while reading its addresses. Close can
-	// otherwise invalidate the tsnet server immediately after this snapshot.
-	mu.Lock()
-	if state != nodeRunning || !started || server == nil {
-		mu.Unlock()
+	node, nodeGeneration, route, ok := runningNodeSnapshot()
+	if !ok {
 		return C.CString("")
 	}
-	ip4, ip6 := server.TailscaleIPs()
-	mu.Unlock()
-
+	ip4, ip6 := node.TailscaleIPs()
+	if !isNodeCurrent(node, nodeGeneration, route.generation) {
+		return C.CString("")
+	}
 	parts := make([]string, 0, 2)
 	if ip4.IsValid() {
 		parts = append(parts, ip4.String())
@@ -754,58 +1100,61 @@ func TermixTS_LastError() *C.char {
 	return C.CString(lastError)
 }
 
-//export TermixTS_Close
-func TermixTS_Close() C.int {
-	// Keep Configure from publishing a new credential set between cancellation of
-	// an in-flight Up and final teardown of its state directory.
-	configureMu.Lock()
-	defer configureMu.Unlock()
-
+func closeNode() error {
 	mu.Lock()
-	for state == nodeClosing {
-		lifecycleCond.Wait()
+	generation++
+	cancels := make([]context.CancelFunc, 0, len(operationCancels)+1)
+	for _, cancel := range operationCancels {
+		cancels = append(cancels, cancel)
 	}
 
-	state = nodeClosing
-	generation++
-	s := server
-	server = nil
-	started = false
-	cancel := upCancel
-	done := upDone
+	var task *cleanupTask
+	switch state {
+	case nodeIdle:
+		clearConfigLocked()
+	case nodeStarting:
+		if startingOperation != nil && startingOperation.cancel != nil {
+			cancels = append(cancels, startingOperation.cancel)
+		}
+		task = beginCleanupLocked(startingOperation, startingOperation.node, true)
+	case nodeRunning:
+		node := server
+		server = nil
+		state = nodeClosing
+		task = beginCleanupLocked(nil, node, true)
+	case nodeClosing:
+		task = activeCleanup
+		if task != nil {
+			task.clearConfig = true
+		}
+	}
 	mu.Unlock()
 
-	if cancel != nil {
+	for _, cancel := range cancels {
 		cancel()
 	}
-	if done != nil {
-		<-done
-	}
-
 	stopErr := stopAllForwardEntries()
-	var closeErr error
-	if s != nil {
-		closeErr = s.Close()
+	if task == nil {
+		return stopErr
 	}
 
-	mu.Lock()
-	startingServer = nil
-	upCancel = nil
-	upDone = nil
-	state = nodeIdle
-	clearConfigLocked()
-	lifecycleCond.Broadcast()
-	mu.Unlock()
+	timer := time.NewTimer(closeWaitBudget)
+	defer timer.Stop()
+	select {
+	case <-task.done:
+		return errors.Join(stopErr, task.err)
+	case <-timer.C:
+		return errors.Join(
+			stopErr,
+			fmt.Errorf("tailscale cleanup still in progress after %s; retry Close shortly", closeWaitBudget),
+		)
+	}
+}
 
-	var teardownErrors []error
-	if stopErr != nil {
-		teardownErrors = append(teardownErrors, fmt.Errorf("stop forwards: %w", stopErr))
-	}
-	if closeErr != nil {
-		teardownErrors = append(teardownErrors, fmt.Errorf("close tailscale: %w", closeErr))
-	}
-	if teardownErr := errors.Join(teardownErrors...); teardownErr != nil {
-		setErr(teardownErr)
+//export TermixTS_Close
+func TermixTS_Close() C.int {
+	if err := closeNode(); err != nil {
+		setErr(err)
 		return -1
 	}
 	setErr(nil)
