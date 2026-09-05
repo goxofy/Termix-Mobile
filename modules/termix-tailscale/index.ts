@@ -8,7 +8,10 @@ export type TermixTailscaleConfig = {
   ephemeral?: boolean;
 };
 
+export type ForwardProtocol = "http:" | "https:";
+
 export type ForwardHandle = {
+  protocol: ForwardProtocol;
   remoteHost: string;
   remotePort: number;
   localPort: number;
@@ -23,21 +26,37 @@ type NativeModule = {
     ephemeral: boolean;
   }): Promise<void>;
   up(): Promise<void>;
-  startForward(remoteHost: string, remotePort: number): Promise<number>;
+  startForward(
+    protocol: ForwardProtocol,
+    remoteHost: string,
+    remotePort: number,
+  ): Promise<number>;
   stopForward(
+    protocol: ForwardProtocol,
     remoteHost: string,
     remotePort: number,
     localPort: number,
   ): Promise<void>;
   stopAllForwards(): Promise<void>;
+  isForwardActive(
+    protocol: ForwardProtocol,
+    remoteHost: string,
+    remotePort: number,
+    localPort: number,
+  ): Promise<boolean>;
+  probeForward(
+    protocol: ForwardProtocol,
+    remoteHost: string,
+    remotePort: number,
+    localPort: number,
+  ): Promise<boolean>;
   isUp(): Promise<boolean>;
   getIPs(): Promise<string>;
   close(): Promise<void>;
   getDefaultStateDir(): Promise<string>;
 };
 
-const Native =
-  requireOptionalNativeModule<NativeModule>("TermixTailscale");
+const Native = requireOptionalNativeModule<NativeModule>("TermixTailscale");
 
 /** True when the native module is linked (dev client / production build). */
 export function isTermixTailscaleAvailable(): boolean {
@@ -63,17 +82,20 @@ export async function configureTermixTailscale(
 }
 
 export async function upTermixTailscale(): Promise<void> {
-  if (!Native) throw new Error("Termix Tailscale native module is not available");
+  if (!Native)
+    throw new Error("Termix Tailscale native module is not available");
   await Native.up();
 }
 
 export async function startTermixTailscaleForward(
+  protocol: ForwardProtocol,
   remoteHost: string,
   remotePort: number,
 ): Promise<ForwardHandle> {
-  if (!Native) throw new Error("Termix Tailscale native module is not available");
-  const localPort = await Native.startForward(remoteHost, remotePort);
-  return { remoteHost, remotePort, localPort };
+  if (!Native)
+    throw new Error("Termix Tailscale native module is not available");
+  const localPort = await Native.startForward(protocol, remoteHost, remotePort);
+  return { protocol, remoteHost, remotePort, localPort };
 }
 
 export async function stopTermixTailscaleForward(
@@ -81,6 +103,7 @@ export async function stopTermixTailscaleForward(
 ): Promise<void> {
   if (!Native) return;
   await Native.stopForward(
+    handle.protocol,
     handle.remoteHost,
     handle.remotePort,
     handle.localPort,
@@ -90,6 +113,34 @@ export async function stopTermixTailscaleForward(
 export async function stopAllTermixTailscaleForwards(): Promise<void> {
   if (!Native) return;
   await Native.stopAllForwards();
+}
+
+export async function isTermixTailscaleForwardActive(
+  handle: ForwardHandle,
+): Promise<boolean> {
+  if (!Native) return false;
+  return Native.isForwardActive(
+    handle.protocol,
+    handle.remoteHost,
+    handle.remotePort,
+    handle.localPort,
+  );
+}
+
+/**
+ * True when the forward is registered and its remote target still accepts a
+ * connection through the current node. A bound listener alone is not health.
+ */
+export async function probeTermixTailscaleForward(
+  handle: ForwardHandle,
+): Promise<boolean> {
+  if (!Native) return false;
+  return Native.probeForward(
+    handle.protocol,
+    handle.remoteHost,
+    handle.remotePort,
+    handle.localPort,
+  );
 }
 
 export async function isTermixTailscaleUp(): Promise<boolean> {

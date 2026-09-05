@@ -1,7 +1,8 @@
-// Termix Tailscale bridge: userspace tsnet node + local TCP port forwards.
+// Termix Tailscale bridge: userspace tsnet node + local HTTP(S) forwards.
 //
 // Built as a C archive/shared library and linked into the Expo native module.
-// JS talks to 127.0.0.1:<localPort>; this process dials the real remote over the tailnet.
+// JS talks plain HTTP to 127.0.0.1:<localPort>; this process reverse-proxies
+// each request to the real remote origin over the tailnet.
 package main
 
 /*
@@ -11,10 +12,13 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,20 +30,106 @@ import (
 
 func main() {}
 
-type forwardEntry struct {
-	remoteHost string
-	remotePort int
-	localPort  int
-	listener   net.Listener
-	cancel     context.CancelFunc
+//export TermixTS_IsAvailable
+func TermixTS_IsAvailable() C.int {
+	return 1
 }
 
+//export TermixTS_UpdateDefaultRouteInterface
+func TermixTS_UpdateDefaultRouteInterface(ifName *C.char) {
+	if ifName == nil {
+		return
+	}
+	updateDefaultRouteInterface(C.GoString(ifName))
+}
+
+type forwardEntry struct {
+	protocol    string
+	remoteHost  string
+	remotePort  int
+	localPort   int
+	server      *tsnet.Server
+	generation  uint64
+	listener    net.Listener
+	cancel      context.CancelFunc
+	requestCtx  context.Context
+	proxy       *http.Server
+	transport   *http.Transport
+	connections map[net.Conn]struct{}
+	connMu      sync.Mutex
+	stopOnce    sync.Once
+	stopErr     error
+}
+
+// forwardListener wraps accepted connections so hijacked WebSockets can remove
+// themselves from forwardEntry.connections when their real Close occurs.
+// net/http treats StateHijacked as terminal and never emits StateClosed after it.
+type forwardListener struct {
+	net.Listener
+	entry *forwardEntry
+}
+
+func (l *forwardListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &forwardConnection{Conn: conn, entry: l.entry}, nil
+}
+
+type forwardConnection struct {
+	net.Conn
+	entry *forwardEntry
+}
+
+func (c *forwardConnection) Close() error {
+	err := c.Conn.Close()
+	c.entry.untrackConnection(c)
+	return err
+}
+
+func (c *forwardConnection) CloseRead() error {
+	if conn, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return conn.CloseRead()
+	}
+	return nil
+}
+
+func (c *forwardConnection) CloseWrite() error {
+	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return nil
+}
+
+type nodeState uint8
+
+const (
+	nodeIdle nodeState = iota
+	nodeStarting
+	nodeRunning
+	nodeClosing
+)
+
 var (
-	mu        sync.Mutex
-	server    *tsnet.Server
-	started   bool
-	forwards  = map[string]*forwardEntry{}
-	lastError string
+	// mu protects the tsnet lifecycle and configuration. It is never held while
+	// calling tsnet.Server.Up or Close because both may block on I/O.
+	mu                sync.Mutex
+	lifecycleCond     = sync.NewCond(&mu)
+	configureMu       sync.Mutex
+	errorMu           sync.Mutex
+	forwardMu         sync.Mutex
+	server            *tsnet.Server
+	startingServer    *tsnet.Server
+	started           bool
+	state             = nodeIdle
+	upCancel          context.CancelFunc
+	upDone            chan struct{}
+	generation        uint64
+	forwardGeneration uint64
+	forwards          = map[string]*forwardEntry{}
+	lastError         string
+	configured        bool
 
 	cfgAuthKey   string
 	cfgHostname  string
@@ -47,7 +137,19 @@ var (
 	cfgEphemeral bool
 )
 
+// clearConfigLocked forgets credentials and state-directory ownership after a
+// native close. The caller must hold mu.
+func clearConfigLocked() {
+	configured = false
+	cfgAuthKey = ""
+	cfgHostname = ""
+	cfgStateDir = ""
+	cfgEphemeral = false
+}
+
 func setErr(err error) {
+	errorMu.Lock()
+	defer errorMu.Unlock()
 	if err == nil {
 		lastError = ""
 		return
@@ -55,35 +157,61 @@ func setErr(err error) {
 	lastError = err.Error()
 }
 
-func forwardKey(host string, remotePort, localPort int) string {
-	return fmt.Sprintf("%s:%d->%d", host, remotePort, localPort)
+func forwardKey(protocol, host string, remotePort, localPort int) string {
+	return fmt.Sprintf(
+		"%s://%s:%d->%d",
+		strings.ToLower(strings.TrimSpace(protocol)),
+		normalizeForwardHost(host),
+		remotePort,
+		localPort,
+	)
 }
 
 //export TermixTS_Configure
 func TermixTS_Configure(authKey, hostname, stateDir *C.char, ephemeral C.int) C.int {
+	auth := C.GoString(authKey)
+	host := strings.TrimSpace(C.GoString(hostname))
+	dir := strings.TrimSpace(C.GoString(stateDir))
+	if host == "" {
+		host = "termix-mobile"
+	}
+	if dir == "" {
+		setErr(fmt.Errorf("state directory is required"))
+		return -1
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		setErr(fmt.Errorf("create state dir: %w", err))
+		return -1
+	}
+
+	configureMu.Lock()
+	defer configureMu.Unlock()
+
 	mu.Lock()
 	defer mu.Unlock()
-
-	if started {
+	for state == nodeClosing {
+		lifecycleCond.Wait()
+	}
+	if state != nodeIdle || started {
 		setErr(fmt.Errorf("already started; call TermixTS_Close before reconfigure"))
 		return -1
 	}
 
-	cfgAuthKey = C.GoString(authKey)
-	cfgHostname = C.GoString(hostname)
-	cfgStateDir = C.GoString(stateDir)
+	cfgAuthKey = auth
+	cfgHostname = host
+	cfgStateDir = dir
 	cfgEphemeral = ephemeral != 0
+	configured = true
 
-	if cfgHostname == "" {
-		cfgHostname = "termix-mobile"
-	}
-	if cfgStateDir == "" {
-		setErr(fmt.Errorf("state directory is required"))
-		return -1
-	}
-	if err := os.MkdirAll(cfgStateDir, 0o700); err != nil {
-		setErr(fmt.Errorf("create state dir: %w", err))
-		return -1
+	// On Android, $XDG_CACHE_HOME / $HOME are unset, so logpolicy's
+	// os.UserCacheDir() fails and tsnet panics ("no safe place found to store
+	// log state"). Point XDG_CACHE_HOME at our writable state directory parent.
+	// iOS uses the darwin branch of UserCacheDir and is unaffected.
+	if runtime.GOOS == "android" {
+		cacheParent := filepath.Dir(cfgStateDir)
+		if err := os.MkdirAll(cacheParent, 0o700); err == nil {
+			_ = os.Setenv("XDG_CACHE_HOME", cacheParent)
+		}
 	}
 
 	setErr(nil)
@@ -92,52 +220,146 @@ func TermixTS_Configure(authKey, hostname, stateDir *C.char, ephemeral C.int) C.
 
 //export TermixTS_Up
 func TermixTS_Up() C.int {
-	mu.Lock()
-	defer mu.Unlock()
+	for {
+		mu.Lock()
+		switch state {
+		case nodeRunning:
+			if started && server != nil {
+				mu.Unlock()
+				setErr(nil)
+				return 0
+			}
+			state = nodeIdle
+		case nodeStarting:
+			done := upDone
+			mu.Unlock()
+			if done != nil {
+				<-done
+			}
+			continue
+		case nodeClosing:
+			lifecycleCond.Wait()
+			mu.Unlock()
+			continue
+		}
 
-	if started && server != nil {
-		setErr(nil)
-		return 0
-	}
+		if !configured || cfgStateDir == "" {
+			mu.Unlock()
+			setErr(fmt.Errorf("tailscale is not configured"))
+			return -1
+		}
 
-	s := &tsnet.Server{
-		Hostname:  cfgHostname,
-		AuthKey:   cfgAuthKey,
-		Dir:       cfgStateDir,
-		Ephemeral: cfgEphemeral,
-	}
+		s := &tsnet.Server{
+			Hostname:  cfgHostname,
+			AuthKey:   cfgAuthKey,
+			Dir:       cfgStateDir,
+			Ephemeral: cfgEphemeral,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		done := make(chan struct{})
+		generation++
+		myGeneration := generation
+		state = nodeStarting
+		startingServer = s
+		upCancel = cancel
+		upDone = done
+		mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
+		// Android 11+ blocks the netlink enumeration used by net.Interfaces.
+		// Register the ioctl-backed getter before netmon is created inside Up.
+		registerAndroidInterfaceGetter()
 
-	if _, err := s.Up(ctx); err != nil {
-		_ = s.Close()
-		setErr(fmt.Errorf("tailscale up: %w", err))
+		_, upErr := s.Up(ctx)
+		cancel()
+		var candidateCloseErr error
+		if upErr != nil {
+			candidateCloseErr = s.Close()
+		}
+
+		mu.Lock()
+		externallyClosing := state == nodeClosing && generation != myGeneration
+		publish := upErr == nil && state == nodeStarting &&
+			generation == myGeneration && startingServer == s
+		if publish {
+			server = s
+			started = true
+			state = nodeRunning
+		} else {
+			server = nil
+			started = false
+			// A concurrent Close owns nodeClosing until teardown is complete. For
+			// an ordinary Up failure, reserve the state directory while this
+			// goroutine closes its candidate server.
+			if !externallyClosing {
+				state = nodeClosing
+			}
+		}
+		mu.Unlock()
+
+		if !publish && upErr == nil {
+			candidateCloseErr = s.Close()
+		}
+
+		mu.Lock()
+		if startingServer == s {
+			startingServer = nil
+		}
+		if upDone == done {
+			upCancel = nil
+			close(done)
+			upDone = nil
+		}
+		if !publish && !externallyClosing {
+			state = nodeIdle
+		}
+		lifecycleCond.Broadcast()
+		mu.Unlock()
+
+		if publish {
+			setErr(nil)
+			return 0
+		}
+		var resultErr error
+		if upErr == nil {
+			resultErr = fmt.Errorf("tailscale up canceled")
+		} else {
+			resultErr = fmt.Errorf("tailscale up: %w", upErr)
+		}
+		if candidateCloseErr != nil {
+			resultErr = fmt.Errorf("%w; close candidate: %v", resultErr, candidateCloseErr)
+		}
+		setErr(resultErr)
 		return -1
 	}
-
-	server = s
-	started = true
-	setErr(nil)
-	return 0
 }
 
 //export TermixTS_StartForward
-func TermixTS_StartForward(remoteHost *C.char, remotePort C.int, localPortOut *C.int) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if !started || server == nil {
-		setErr(fmt.Errorf("tailscale is not connected; call Up first"))
+func TermixTS_StartForward(protocol *C.char, remoteHost *C.char, remotePort C.int, localPortOut *C.int) C.int {
+	scheme, err := normalizeForwardProtocol(C.GoString(protocol))
+	if err != nil {
+		setErr(err)
 		return -1
 	}
-
-	host := strings.TrimSpace(C.GoString(remoteHost))
+	host := normalizeForwardHost(C.GoString(remoteHost))
 	rport := int(remotePort)
 	if host == "" || rport <= 0 || rport > 65535 {
 		setErr(fmt.Errorf("invalid remote host/port"))
 		return -1
 	}
+
+	mu.Lock()
+	if state != nodeRunning || !started || server == nil {
+		mu.Unlock()
+		setErr(fmt.Errorf("tailscale is not connected; call Up first"))
+		return -1
+	}
+	s := server
+	myGeneration := generation
+	mu.Unlock()
+
+	forwardMu.Lock()
+	myForwardGeneration := forwardGeneration
+	forwardMu.Unlock()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -145,19 +367,81 @@ func TermixTS_StartForward(remoteHost *C.char, remotePort C.int, localPortOut *C
 		return -1
 	}
 
-	localPort := ln.Addr().(*net.TCPAddr).Port
-	ctx, cancel := context.WithCancel(context.Background())
-	entry := &forwardEntry{
-		remoteHost: host,
-		remotePort: rport,
-		localPort:  localPort,
-		listener:   ln,
-		cancel:     cancel,
+	if !isCurrentRunningServer(s, myGeneration) {
+		_ = ln.Close()
+		setErr(fmt.Errorf("tailscale is closing; forward was not started"))
+		return -1
 	}
-	key := forwardKey(host, rport, localPort)
-	forwards[key] = entry
+	if err := probeForwardTarget(s.Dial, host, rport); err != nil {
+		_ = ln.Close()
+		setErr(err)
+		return -1
+	}
+	if !isCurrentRunningServer(s, myGeneration) {
+		_ = ln.Close()
+		setErr(fmt.Errorf("tailscale is closing; forward was not started"))
+		return -1
+	}
 
-	go acceptLoop(ctx, entry)
+	localPort := ln.Addr().(*net.TCPAddr).Port
+	requestCtx, cancel := context.WithCancel(context.Background())
+	entry := &forwardEntry{
+		protocol:    scheme,
+		remoteHost:  host,
+		remotePort:  rport,
+		localPort:   localPort,
+		server:      s,
+		generation:  myGeneration,
+		cancel:      cancel,
+		requestCtx:  requestCtx,
+		connections: make(map[net.Conn]struct{}),
+	}
+	entry.listener = &forwardListener{Listener: ln, entry: entry}
+
+	proxy, err := newForwardProxy(scheme, host, rport, localPort, s.Dial)
+	if err != nil {
+		_ = ln.Close()
+		cancel()
+		setErr(err)
+		return -1
+	}
+	entry.transport, _ = proxy.Transport.(*http.Transport)
+	entry.proxy = &http.Server{
+		Handler: forwardHandler(entry, proxy),
+		ConnState: func(conn net.Conn, connState http.ConnState) {
+			entry.trackConnection(conn, connState)
+		},
+	}
+	key := forwardKey(scheme, host, rport, localPort)
+
+	// Serialize publication with Close/StopAll. A close that began after the
+	// initial lifecycle check must not leave a listener behind the old node.
+	forwardMu.Lock()
+	mu.Lock()
+	canPublish := state == nodeRunning && server == s && generation == myGeneration &&
+		forwardGeneration == myForwardGeneration
+	mu.Unlock()
+	if canPublish {
+		forwards[key] = entry
+	}
+	forwardMu.Unlock()
+	if !canPublish {
+		stopEntry(entry)
+		setErr(fmt.Errorf("tailscale is closing; forward was not started"))
+		return -1
+	}
+
+	go func() {
+		if serveErr := entry.proxy.Serve(entry.listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			forwardMu.Lock()
+			if forwards[key] == entry {
+				delete(forwards, key)
+			}
+			forwardMu.Unlock()
+			stopEntry(entry)
+			setErr(fmt.Errorf("serve localhost forward: %w", serveErr))
+		}
+	}()
 
 	if localPortOut != nil {
 		*localPortOut = C.int(localPort)
@@ -166,102 +450,276 @@ func TermixTS_StartForward(remoteHost *C.char, remotePort C.int, localPortOut *C
 	return 0
 }
 
-func acceptLoop(ctx context.Context, entry *forwardEntry) {
-	for {
-		conn, err := entry.listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				// Listener closed or hard accept error — exit loop.
-				return
-			}
-		}
-		go proxyConn(ctx, conn, entry.remoteHost, entry.remotePort)
+func normalizeForwardHost(host string) string {
+	host = strings.TrimSpace(host)
+	if len(host) >= 2 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
 	}
+	return strings.ToLower(host)
 }
 
-func proxyConn(ctx context.Context, local net.Conn, remoteHost string, remotePort int) {
-	defer local.Close()
-
+func isCurrentRunningServer(s *tsnet.Server, candidateGeneration uint64) bool {
 	mu.Lock()
-	s := server
-	mu.Unlock()
-	if s == nil {
-		return
-	}
+	defer mu.Unlock()
+	return state == nodeRunning && started && server == s && generation == candidateGeneration
+}
 
-	addr := net.JoinHostPort(remoteHost, strconv.Itoa(remotePort))
-	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+const (
+	// startForwardProbeTimeout bounds the reachability check performed before a
+	// new localhost forward is published.
+	startForwardProbeTimeout = 10 * time.Second
+	// forwardHealthProbeTimeout bounds TermixTS_ProbeForward, which foreground
+	// recovery runs before deciding whether to reuse or rebuild the transport.
+	forwardHealthProbeTimeout = 5 * time.Second
+)
+
+func probeForwardTarget(dialContext forwardDialContext, remoteHost string, remotePort int) error {
+	return probeForwardTargetWithTimeout(dialContext, remoteHost, remotePort, startForwardProbeTimeout)
+}
+
+func probeForwardTargetWithTimeout(
+	dialContext forwardDialContext,
+	remoteHost string,
+	remotePort int,
+	timeout time.Duration,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
-	remote, err := s.Dial(dialCtx, "tcp", addr)
+	address := net.JoinHostPort(remoteHost, strconv.Itoa(remotePort))
+	connection, err := dialContext(ctx, "tcp", address)
 	if err != nil {
+		return fmt.Errorf("probe Tailscale target %s: %w", address, err)
+	}
+	_ = connection.Close()
+	return nil
+}
+
+func forwardHandler(entry *forwardEntry, proxy http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parent := entry.requestCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		// Abort the upstream request when either the client goes away or the
+		// forward is stopped/rebuilt underneath it.
+		ctx, cancel := context.WithCancel(parent)
+		defer cancel()
+		stop := context.AfterFunc(r.Context(), cancel)
+		defer stop()
+		proxy.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (entry *forwardEntry) trackConnection(conn net.Conn, state http.ConnState) {
+	if state == http.StateClosed {
+		entry.untrackConnection(conn)
 		return
 	}
-	defer remote.Close()
+	entry.connMu.Lock()
+	entry.connections[conn] = struct{}{}
+	entry.connMu.Unlock()
+}
 
-	errc := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(remote, local)
-		errc <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(local, remote)
-		errc <- struct{}{}
-	}()
-
-	select {
-	case <-ctx.Done():
-	case <-errc:
-	}
+func (entry *forwardEntry) untrackConnection(conn net.Conn) {
+	entry.connMu.Lock()
+	delete(entry.connections, conn)
+	entry.connMu.Unlock()
 }
 
 //export TermixTS_StopForward
-func TermixTS_StopForward(remoteHost *C.char, remotePort C.int, localPort C.int) C.int {
-	mu.Lock()
-	defer mu.Unlock()
+func TermixTS_StopForward(protocol *C.char, remoteHost *C.char, remotePort C.int, localPort C.int) C.int {
+	scheme, err := normalizeForwardProtocol(C.GoString(protocol))
+	if err != nil {
+		setErr(err)
+		return -1
+	}
+	key := forwardKey(scheme, C.GoString(remoteHost), int(remotePort), int(localPort))
 
-	host := C.GoString(remoteHost)
-	key := forwardKey(host, int(remotePort), int(localPort))
+	forwardMu.Lock()
 	entry, ok := forwards[key]
+	var stopErr error
+	if ok {
+		delete(forwards, key)
+		stopErr = stopEntry(entry)
+	}
+	forwardMu.Unlock()
+
 	if !ok {
 		setErr(fmt.Errorf("forward not found"))
 		return -1
 	}
-	stopEntry(entry)
-	delete(forwards, key)
+	if stopErr != nil {
+		setErr(fmt.Errorf("stop forward: %w", stopErr))
+		return -1
+	}
 	setErr(nil)
 	return 0
 }
 
 //export TermixTS_StopAllForwards
 func TermixTS_StopAllForwards() C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	for k, entry := range forwards {
-		stopEntry(entry)
-		delete(forwards, k)
+	if err := stopAllForwardEntries(); err != nil {
+		setErr(fmt.Errorf("stop all forwards: %w", err))
+		return -1
 	}
 	setErr(nil)
 	return 0
 }
 
-func stopEntry(entry *forwardEntry) {
-	if entry.cancel != nil {
-		entry.cancel()
+//export TermixTS_IsForwardActive
+func TermixTS_IsForwardActive(protocol *C.char, remoteHost *C.char, remotePort C.int, localPort C.int) C.int {
+	scheme, err := normalizeForwardProtocol(C.GoString(protocol))
+	if err != nil {
+		setErr(err)
+		return 0
 	}
-	if entry.listener != nil {
-		_ = entry.listener.Close()
+	key := forwardKey(scheme, C.GoString(remoteHost), int(remotePort), int(localPort))
+
+	forwardMu.Lock()
+	entry, ok := forwards[key]
+	if ok {
+		mu.Lock()
+		ok = state == nodeRunning && started && server == entry.server &&
+			generation == entry.generation
+		mu.Unlock()
 	}
+	forwardMu.Unlock()
+	if ok {
+		return 1
+	}
+	return 0
+}
+
+//export TermixTS_ProbeForward
+func TermixTS_ProbeForward(protocol *C.char, remoteHost *C.char, remotePort C.int, localPort C.int) C.int {
+	scheme, err := normalizeForwardProtocol(C.GoString(protocol))
+	if err != nil {
+		setErr(err)
+		return 0
+	}
+	key := forwardKey(scheme, C.GoString(remoteHost), int(remotePort), int(localPort))
+
+	forwardMu.Lock()
+	entry, ok := forwards[key]
+	forwardMu.Unlock()
+	if !ok || !isCurrentRunningServer(entry.server, entry.generation) {
+		setErr(fmt.Errorf("forward is not active"))
+		return 0
+	}
+
+	// Dial through the node that owns this forward without holding any lock, so
+	// a slow tailnet cannot block Close or StartForward. A bound listener alone
+	// proves nothing after iOS suspension; the target must answer over Tailscale.
+	if err := probeForwardTargetWithTimeout(
+		entry.server.Dial,
+		entry.remoteHost,
+		entry.remotePort,
+		forwardHealthProbeTimeout,
+	); err != nil {
+		setErr(err)
+		return 0
+	}
+
+	forwardMu.Lock()
+	stillRegistered := forwards[key] == entry
+	forwardMu.Unlock()
+	if !stillRegistered || !isCurrentRunningServer(entry.server, entry.generation) {
+		setErr(fmt.Errorf("forward was replaced during probe"))
+		return 0
+	}
+	setErr(nil)
+	return 1
+}
+
+func stopAllForwardEntries() error {
+	forwardMu.Lock()
+	defer forwardMu.Unlock()
+
+	forwardGeneration++
+	entries := make([]*forwardEntry, 0, len(forwards))
+	for key, entry := range forwards {
+		delete(forwards, key)
+		entries = append(entries, entry)
+	}
+
+	var stopErrors []error
+	for _, entry := range entries {
+		if err := stopEntry(entry); err != nil {
+			stopErrors = append(stopErrors, err)
+		}
+	}
+	return errors.Join(stopErrors...)
+}
+
+func stopEntry(entry *forwardEntry) error {
+	if entry == nil {
+		return nil
+	}
+	entry.stopOnce.Do(func() {
+		var stopErrors []error
+		if entry.cancel != nil {
+			entry.cancel()
+		}
+		if entry.proxy != nil {
+			if err := entry.proxy.Close(); isUnexpectedCloseError(err) {
+				stopErrors = append(stopErrors, fmt.Errorf("close HTTP proxy: %w", err))
+			}
+		}
+		if entry.listener != nil {
+			if err := entry.listener.Close(); isUnexpectedCloseError(err) {
+				stopErrors = append(stopErrors, fmt.Errorf("close localhost listener: %w", err))
+			}
+		}
+		if entry.transport != nil {
+			entry.transport.CloseIdleConnections()
+		}
+
+		entry.connMu.Lock()
+		connections := make([]net.Conn, 0, len(entry.connections))
+		for conn := range entry.connections {
+			connections = append(connections, conn)
+		}
+		entry.connMu.Unlock()
+		for _, conn := range connections {
+			if err := conn.Close(); isUnexpectedCloseError(err) {
+				stopErrors = append(stopErrors, fmt.Errorf("close proxy connection: %w", err))
+			}
+		}
+		entry.stopErr = errors.Join(stopErrors...)
+	})
+	return entry.stopErr
+}
+
+func isUnexpectedCloseError(err error) bool {
+	return err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed)
 }
 
 //export TermixTS_IsUp
 func TermixTS_IsUp() C.int {
 	mu.Lock()
-	defer mu.Unlock()
-	if started && server != nil {
+	if state != nodeRunning || !started || server == nil {
+		mu.Unlock()
+		return 0
+	}
+	s := server
+	myGeneration := generation
+	mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client, err := s.LocalClient()
+	if err != nil {
+		return 0
+	}
+	status, err := client.StatusWithoutPeers(ctx)
+	if err != nil || status == nil || !strings.EqualFold(status.BackendState, "Running") {
+		return 0
+	}
+
+	mu.Lock()
+	stillRunning := state == nodeRunning && started && server == s && generation == myGeneration
+	mu.Unlock()
+	if stillRunning {
 		return 1
 	}
 	return 0
@@ -269,13 +727,16 @@ func TermixTS_IsUp() C.int {
 
 //export TermixTS_GetIPs
 func TermixTS_GetIPs() *C.char {
+	// Keep the server pointer protected while reading its addresses. Close can
+	// otherwise invalidate the tsnet server immediately after this snapshot.
 	mu.Lock()
-	s := server
-	mu.Unlock()
-	if s == nil {
+	if state != nodeRunning || !started || server == nil {
+		mu.Unlock()
 		return C.CString("")
 	}
-	ip4, ip6 := s.TailscaleIPs()
+	ip4, ip6 := server.TailscaleIPs()
+	mu.Unlock()
+
 	parts := make([]string, 0, 2)
 	if ip4.IsValid() {
 		parts = append(parts, ip4.String())
@@ -288,26 +749,65 @@ func TermixTS_GetIPs() *C.char {
 
 //export TermixTS_LastError
 func TermixTS_LastError() *C.char {
-	mu.Lock()
-	defer mu.Unlock()
+	errorMu.Lock()
+	defer errorMu.Unlock()
 	return C.CString(lastError)
 }
 
 //export TermixTS_Close
 func TermixTS_Close() C.int {
+	// Keep Configure from publishing a new credential set between cancellation of
+	// an in-flight Up and final teardown of its state directory.
+	configureMu.Lock()
+	defer configureMu.Unlock()
+
 	mu.Lock()
-	defer mu.Unlock()
-
-	for k, entry := range forwards {
-		stopEntry(entry)
-		delete(forwards, k)
+	for state == nodeClosing {
+		lifecycleCond.Wait()
 	}
 
-	if server != nil {
-		_ = server.Close()
-		server = nil
-	}
+	state = nodeClosing
+	generation++
+	s := server
+	server = nil
 	started = false
+	cancel := upCancel
+	done := upDone
+	mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+
+	stopErr := stopAllForwardEntries()
+	var closeErr error
+	if s != nil {
+		closeErr = s.Close()
+	}
+
+	mu.Lock()
+	startingServer = nil
+	upCancel = nil
+	upDone = nil
+	state = nodeIdle
+	clearConfigLocked()
+	lifecycleCond.Broadcast()
+	mu.Unlock()
+
+	var teardownErrors []error
+	if stopErr != nil {
+		teardownErrors = append(teardownErrors, fmt.Errorf("stop forwards: %w", stopErr))
+	}
+	if closeErr != nil {
+		teardownErrors = append(teardownErrors, fmt.Errorf("close tailscale: %w", closeErr))
+	}
+	if teardownErr := errors.Join(teardownErrors...); teardownErr != nil {
+		setErr(teardownErr)
+		return -1
+	}
 	setErr(nil)
 	return 0
 }

@@ -23,14 +23,31 @@ class TermixTailscaleModule : Module() {
 
   private external fun nativeUp(): Int
   private external fun nativeClose(): Int
-  private external fun nativeStartForward(remoteHost: String, remotePort: Int): Int
+  private external fun nativeStartForward(
+    protocol: String,
+    remoteHost: String,
+    remotePort: Int,
+  ): Int
   private external fun nativeStopForward(
+    protocol: String,
     remoteHost: String,
     remotePort: Int,
     localPort: Int,
   ): Int
 
   private external fun nativeStopAllForwards(): Int
+  private external fun nativeIsForwardActive(
+    protocol: String,
+    remoteHost: String,
+    remotePort: Int,
+    localPort: Int,
+  ): Boolean
+  private external fun nativeProbeForward(
+    protocol: String,
+    remoteHost: String,
+    remotePort: Int,
+    localPort: Int,
+  ): Boolean
   private external fun nativeIsUp(): Boolean
   private external fun nativeGetIPs(): String
   private external fun nativeLastError(): String
@@ -72,20 +89,32 @@ class TermixTailscaleModule : Module() {
       if (rc != 0) throw Exception(nativeLastError())
     }
 
-    AsyncFunction("startForward") { remoteHost: String, remotePort: Int ->
+    AsyncFunction("startForward") { protocol: String, remoteHost: String, remotePort: Int ->
       ensureLoaded()
-      val localPort = nativeStartForward(remoteHost, remotePort)
+      val localPort = nativeStartForward(protocol, remoteHost, remotePort)
       if (localPort <= 0) throw Exception(nativeLastError())
       localPort
     }
 
-    AsyncFunction("stopForward") { remoteHost: String, remotePort: Int, localPort: Int ->
+    AsyncFunction("stopForward") { protocol: String, remoteHost: String, remotePort: Int, localPort: Int ->
       ensureLoaded()
-      nativeStopForward(remoteHost, remotePort, localPort)
+      val rc = nativeStopForward(protocol, remoteHost, remotePort, localPort)
+      if (rc != 0) throw Exception(nativeLastError())
     }
 
     AsyncFunction("stopAllForwards") {
-      if (libraryLoaded) nativeStopAllForwards()
+      if (libraryLoaded) {
+        val rc = nativeStopAllForwards()
+        if (rc != 0) throw Exception(nativeLastError())
+      }
+    }
+
+    AsyncFunction("isForwardActive") { protocol: String, remoteHost: String, remotePort: Int, localPort: Int ->
+      if (!libraryLoaded) false else nativeIsForwardActive(protocol, remoteHost, remotePort, localPort)
+    }
+
+    AsyncFunction("probeForward") { protocol: String, remoteHost: String, remotePort: Int, localPort: Int ->
+      if (!libraryLoaded) false else nativeProbeForward(protocol, remoteHost, remotePort, localPort)
     }
 
     AsyncFunction("isUp") {
@@ -97,7 +126,10 @@ class TermixTailscaleModule : Module() {
     }
 
     AsyncFunction("close") {
-      if (libraryLoaded) nativeClose()
+      if (libraryLoaded) {
+        val rc = nativeClose()
+        if (rc != 0) throw Exception(nativeLastError())
+      }
     }
   }
 

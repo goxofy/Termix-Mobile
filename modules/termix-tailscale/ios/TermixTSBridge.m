@@ -16,6 +16,14 @@ static NSString *TermixTSLastErrorString(void) {
 
 @implementation TermixTSBridge
 
++ (BOOL)isAvailable {
+  return TermixTS_IsAvailable() == 1;
+}
+
++ (void)updateDefaultRouteInterface:(NSString *)interfaceName {
+  TermixTS_UpdateDefaultRouteInterface(interfaceName.UTF8String ?: "");
+}
+
 + (NSString *)configureWithAuthKey:(NSString *)authKey
                           hostname:(NSString *)hostname
                           stateDir:(NSString *)stateDir
@@ -38,28 +46,56 @@ static NSString *TermixTSLastErrorString(void) {
   return nil;
 }
 
-+ (NSDictionary *)startForwardToHost:(NSString *)remoteHost
-                                port:(int)remotePort {
++ (NSDictionary *)startForwardWithProtocol:(NSString *)protocol
+                                      host:(NSString *)remoteHost
+                                      port:(int)remotePort {
   int localPort = 0;
-  int rc = TermixTS_StartForward(remoteHost.UTF8String ?: "", remotePort, &localPort);
+  int rc = TermixTS_StartForward(protocol.UTF8String ?: "http:",
+                                 remoteHost.UTF8String ?: "", remotePort,
+                                 &localPort);
   if (rc != 0) {
     return @{@"error" : TermixTSLastErrorString()};
   }
   return @{@"localPort" : @(localPort)};
 }
 
-+ (NSString *)stopForwardToHost:(NSString *)remoteHost
-                           port:(int)remotePort
-                      localPort:(int)localPort {
-  int rc = TermixTS_StopForward(remoteHost.UTF8String ?: "", remotePort, localPort);
++ (NSString *)stopForwardWithProtocol:(NSString *)protocol
+                                 host:(NSString *)remoteHost
+                                 port:(int)remotePort
+                            localPort:(int)localPort {
+  int rc = TermixTS_StopForward(protocol.UTF8String ?: "http:",
+                                remoteHost.UTF8String ?: "", remotePort,
+                                localPort);
   if (rc != 0) {
     return TermixTSLastErrorString();
   }
   return nil;
 }
 
-+ (void)stopAllForwards {
-  TermixTS_StopAllForwards();
++ (NSString * _Nullable)stopAllForwards {
+  int rc = TermixTS_StopAllForwards();
+  if (rc != 0) {
+    return TermixTSLastErrorString();
+  }
+  return nil;
+}
+
++ (BOOL)isForwardActiveWithProtocol:(NSString *)protocol
+                               host:(NSString *)remoteHost
+                               port:(int)remotePort
+                          localPort:(int)localPort {
+  return TermixTS_IsForwardActive(protocol.UTF8String ?: "http:",
+                                  remoteHost.UTF8String ?: "", remotePort,
+                                  localPort) == 1;
+}
+
++ (BOOL)probeForwardWithProtocol:(NSString *)protocol
+                            host:(NSString *)remoteHost
+                            port:(int)remotePort
+                       localPort:(int)localPort {
+  return TermixTS_ProbeForward(protocol.UTF8String ?: "http:",
+                               remoteHost.UTF8String ?: "", remotePort,
+                               localPort) == 1;
 }
 
 + (BOOL)isUp {
@@ -75,8 +111,12 @@ static NSString *TermixTSLastErrorString(void) {
   return s ?: @"";
 }
 
-+ (void)close {
-  TermixTS_Close();
++ (NSString * _Nullable)close {
+  int rc = TermixTS_Close();
+  if (rc != 0) {
+    return TermixTSLastErrorString();
+  }
+  return nil;
 }
 
 + (NSString *)defaultStateDir {

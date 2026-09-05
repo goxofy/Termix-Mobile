@@ -63,20 +63,27 @@ Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeClose(
 
 JNIEXPORT jint JNICALL
 Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeStartForward(
-    JNIEnv *env, jobject thiz, jstring remoteHost, jint remotePort) {
+    JNIEnv *env, jobject thiz, jstring protocol, jstring remoteHost,
+    jint remotePort) {
+  char *p = get_utf_chars(env, protocol);
   char *h = get_utf_chars(env, remoteHost);
   int localPort = 0;
-  int rc = TermixTS_StartForward(h ? h : "", remotePort, &localPort);
+  int rc = TermixTS_StartForward(p ? p : "http:", h ? h : "", remotePort,
+                                  &localPort);
+  release_utf_chars(env, protocol, p);
   release_utf_chars(env, remoteHost, h);
   return rc == 0 ? localPort : -1;
 }
 
 JNIEXPORT jint JNICALL
 Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeStopForward(
-    JNIEnv *env, jobject thiz, jstring remoteHost, jint remotePort,
-    jint localPort) {
+    JNIEnv *env, jobject thiz, jstring protocol, jstring remoteHost,
+    jint remotePort, jint localPort) {
+  char *p = get_utf_chars(env, protocol);
   char *h = get_utf_chars(env, remoteHost);
-  int rc = TermixTS_StopForward(h ? h : "", remotePort, localPort);
+  int rc = TermixTS_StopForward(p ? p : "http:", h ? h : "", remotePort,
+                                 localPort);
+  release_utf_chars(env, protocol, p);
   release_utf_chars(env, remoteHost, h);
   return rc;
 }
@@ -85,6 +92,32 @@ JNIEXPORT jint JNICALL
 Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeStopAllForwards(
     JNIEnv *env, jobject thiz) {
   return TermixTS_StopAllForwards();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeIsForwardActive(
+    JNIEnv *env, jobject thiz, jstring protocol, jstring remoteHost,
+    jint remotePort, jint localPort) {
+  char *p = get_utf_chars(env, protocol);
+  char *h = get_utf_chars(env, remoteHost);
+  int active = TermixTS_IsForwardActive(p ? p : "http:", h ? h : "",
+                                         remotePort, localPort);
+  release_utf_chars(env, protocol, p);
+  release_utf_chars(env, remoteHost, h);
+  return active == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_expo_modules_termixtailscale_TermixTailscaleModule_nativeProbeForward(
+    JNIEnv *env, jobject thiz, jstring protocol, jstring remoteHost,
+    jint remotePort, jint localPort) {
+  char *p = get_utf_chars(env, protocol);
+  char *h = get_utf_chars(env, remoteHost);
+  int reachable = TermixTS_ProbeForward(p ? p : "http:", h ? h : "",
+                                        remotePort, localPort);
+  release_utf_chars(env, protocol, p);
+  release_utf_chars(env, remoteHost, h);
+  return reachable == 1 ? JNI_TRUE : JNI_FALSE;
 }
 
 // ---- Status / info ---------------------------------------------------------

@@ -8,6 +8,12 @@
 extern "C" {
 #endif
 
+// 1 when the real Go/tsnet implementation is linked; 0 for the fallback stub.
+int TermixTS_IsAvailable(void);
+
+// Provide the current physical default-route interface on iOS. Empty hints are ignored.
+void TermixTS_UpdateDefaultRouteInterface(const char *ifName);
+
 // Configure before Up. stateDir must be a writable path. Returns 0 on success.
 int TermixTS_Configure(const char *authKey, const char *hostname,
                        const char *stateDir, int ephemeral);
@@ -15,15 +21,25 @@ int TermixTS_Configure(const char *authKey, const char *hostname,
 // Join the tailnet (blocking, ~timeout inside). Returns 0 on success.
 int TermixTS_Up(void);
 
-// Listen on 127.0.0.1:<ephemeral> and forward TCP to remoteHost:remotePort over TS.
-// Writes the chosen local port to *localPortOut. Returns 0 on success.
-int TermixTS_StartForward(const char *remoteHost, int remotePort,
-                          int *localPortOut);
+// Listen on 127.0.0.1:<ephemeral> and forward HTTP(S) to remoteHost:remotePort over TS.
+// HTTPS targets are dialed with remoteHost as TLS ServerName while the local
+// app-facing transport remains plain HTTP. Writes the chosen local port to
+// *localPortOut. Returns 0 on success.
+int TermixTS_StartForward(const char *protocol, const char *remoteHost,
+                          int remotePort, int *localPortOut);
 
-int TermixTS_StopForward(const char *remoteHost, int remotePort, int localPort);
+int TermixTS_StopForward(const char *protocol, const char *remoteHost,
+                         int remotePort, int localPort);
 int TermixTS_StopAllForwards(void);
+// 1 when the specified native localhost forward is currently registered.
+int TermixTS_IsForwardActive(const char *protocol, const char *remoteHost,
+                             int remotePort, int localPort);
+// 1 when the forward is registered AND its remote target still accepts a TCP
+// connection through the current tsnet node (bounded, a few seconds).
+int TermixTS_ProbeForward(const char *protocol, const char *remoteHost,
+                          int remotePort, int localPort);
 
-// 1 if Up has succeeded and the node is still open.
+// 1 if Up has succeeded and the node's backend state is still Running.
 int TermixTS_IsUp(void);
 
 // Comma-separated Tailscale IPs. Caller must TermixTS_FreeString.

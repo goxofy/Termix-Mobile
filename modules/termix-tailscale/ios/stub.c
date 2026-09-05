@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+int TermixTS_IsAvailable(void) { return 0; }
+
+void TermixTS_UpdateDefaultRouteInterface(const char *ifName) { (void)ifName; }
+
 static char *dup_err(const char *msg) {
   size_t n = strlen(msg) + 1;
   char *p = (char *)malloc(n);
@@ -23,15 +27,18 @@ int TermixTS_Configure(const char *authKey, const char *hostname,
 
 int TermixTS_Up(void) { return -1; }
 
-int TermixTS_StartForward(const char *remoteHost, int remotePort,
-                          int *localPortOut) {
+int TermixTS_StartForward(const char *protocol, const char *remoteHost,
+                          int remotePort, int *localPortOut) {
+  (void)protocol;
   (void)remoteHost;
   (void)remotePort;
   if (localPortOut) *localPortOut = 0;
   return -1;
 }
 
-int TermixTS_StopForward(const char *remoteHost, int remotePort, int localPort) {
+int TermixTS_StopForward(const char *protocol, const char *remoteHost,
+                         int remotePort, int localPort) {
+  (void)protocol;
   (void)remoteHost;
   (void)remotePort;
   (void)localPort;
@@ -39,6 +46,24 @@ int TermixTS_StopForward(const char *remoteHost, int remotePort, int localPort) 
 }
 
 int TermixTS_StopAllForwards(void) { return 0; }
+
+int TermixTS_IsForwardActive(const char *protocol, const char *remoteHost,
+                             int remotePort, int localPort) {
+  (void)protocol;
+  (void)remoteHost;
+  (void)remotePort;
+  (void)localPort;
+  return 0;
+}
+
+int TermixTS_ProbeForward(const char *protocol, const char *remoteHost,
+                          int remotePort, int localPort) {
+  (void)protocol;
+  (void)remoteHost;
+  (void)remotePort;
+  (void)localPort;
+  return 0;
+}
 
 int TermixTS_IsUp(void) { return 0; }
 
