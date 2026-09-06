@@ -13,7 +13,13 @@ import {
 import { AppLockProvider, useAppLock } from "./contexts/AppLockContext";
 import { LockScreen } from "@/app/components/LockScreen";
 import AuthFlow from "@/app/authentication/AuthFlow";
-import { View, Text, ActivityIndicator, TouchableOpacity } from "react-native";
+import {
+  View,
+  Text,
+  ActivityIndicator,
+  TouchableOpacity,
+  Platform,
+} from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { Toaster } from "sonner-native";
@@ -149,6 +155,15 @@ function RootLayoutContent() {
       <View className="absolute inset-0 bg-background">
         <AuthFlow />
       </View>
+    ) : Platform.OS === "ios" && transportState === "recovering" ? (
+      // Keep the current screen visible during ordinary iOS foreground recovery.
+      // This transparent layer blocks touches until the transport request barrier
+      // is released; terminal input is independently paused by its manager.
+      <View
+        className="absolute inset-0"
+        pointerEvents="auto"
+        collapsable={false}
+      />
     ) : (
       <TransportStatusSurface {...transportStatusProps} overlay />
     );
@@ -167,8 +182,8 @@ function RootLayoutContent() {
   }
 
   // Keep the tab shell mounted after the first successful transport. Later
-  // recovery, authentication, and update surfaces are opaque overlays so they
-  // cannot reset the active route or destroy terminal lifecycle state.
+  // recovery uses a platform-appropriate interaction gate, while authentication
+  // and update surfaces remain opaque overlays; none can reset the active route.
   return (
     <View className="flex-1 bg-background">
       <Stack screenOptions={{ headerShown: false }}>

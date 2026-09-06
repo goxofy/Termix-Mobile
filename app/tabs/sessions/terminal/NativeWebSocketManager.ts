@@ -151,6 +151,7 @@ export class NativeWebSocketManager {
   }
 
   sendInput(data: string): void {
+    if (this.isAppInBackground) return;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(JSON.stringify({ type: "input", data }));
@@ -161,6 +162,7 @@ export class NativeWebSocketManager {
   sendResize(cols: number, rows: number): void {
     this.cols = cols;
     this.rows = rows;
+    if (this.isAppInBackground) return;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(JSON.stringify({ type: "resize", data: { cols, rows } }));
