@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { Stack } from "expo-router";
 import { AppProvider, useAppContext } from "./AppContext";
 import { TerminalSessionsProvider } from "./contexts/TerminalSessionsContext";
@@ -22,6 +23,88 @@ import { FONT_MAP, MONO_FONT, MONO_FONT_BOLD } from "./constants/fonts";
 import "../global.css";
 import UpdateRequired from "@/app/authentication/UpdateRequired";
 
+type TransportStatusSurfaceProps = {
+  failed: boolean;
+  accent: string | undefined;
+  transportError: string | null;
+  retryTransport: () => void;
+  cancelTransportRecovery: () => void;
+  changeServer: () => void;
+  overlay?: boolean;
+};
+
+function TransportStatusSurface({
+  failed,
+  accent,
+  transportError,
+  retryTransport,
+  cancelTransportRecovery,
+  changeServer,
+  overlay = false,
+}: TransportStatusSurfaceProps) {
+  return (
+    <View
+      className={`${
+        overlay ? "absolute inset-0" : "flex-1"
+      } items-center justify-center bg-background px-8`}
+    >
+      {!failed ? <ActivityIndicator size="large" color={accent} /> : null}
+      <Text
+        className={`${failed ? "" : "mt-4"} text-center text-base text-foreground`}
+        style={{ fontFamily: MONO_FONT }}
+      >
+        {failed ? "Connection unavailable" : "Initializing…"}
+      </Text>
+      {transportError ? (
+        <Text
+          className="mt-3 max-w-md text-center text-xs leading-5 text-muted-foreground"
+          style={{ fontFamily: MONO_FONT }}
+        >
+          {transportError}
+        </Text>
+      ) : null}
+      <View className="mt-6 w-full max-w-xs gap-2.5">
+        {failed ? (
+          <TouchableOpacity
+            onPress={retryTransport}
+            className="items-center border border-accent-brand/40 bg-accent-brand/10 px-6 py-3"
+          >
+            <Text
+              className="text-accent-brand"
+              style={{ fontFamily: MONO_FONT_BOLD }}
+            >
+              Retry
+            </Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity
+            onPress={cancelTransportRecovery}
+            className="items-center border border-border bg-card px-6 py-3"
+          >
+            <Text
+              className="text-foreground"
+              style={{ fontFamily: MONO_FONT_BOLD }}
+            >
+              Cancel attempt
+            </Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity
+          onPress={changeServer}
+          className="items-center border border-border bg-card px-6 py-3"
+        >
+          <Text
+            className="text-foreground"
+            style={{ fontFamily: MONO_FONT_BOLD }}
+          >
+            Change server
+          </Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
 function RootLayoutContent() {
   const {
     authFlowVisible,
@@ -34,89 +117,66 @@ function RootLayoutContent() {
     changeServer,
   } = useAppContext();
   const accent = useThemeColor()("accent-brand");
+  const hasBootstrappedTransportRef = useRef(false);
+  const transportBlocked = isLoading || transportState !== "ready";
 
-  if ((isLoading || transportState !== "ready") && authFlowVisible) {
-    return <AuthFlow />;
+  // Once a usable transport has mounted the app, keep the navigation tree alive
+  // across later recovery attempts so the active terminal route and manager are
+  // not destroyed while the shared transport is being rebuilt.
+  if (!hasBootstrappedTransportRef.current && !transportBlocked) {
+    hasBootstrappedTransportRef.current = true;
   }
 
-  if (isLoading || transportState !== "ready") {
-    const failed = transportState === "failed";
-    return (
-      <View className="flex-1 items-center justify-center bg-background px-8">
-        {!failed ? <ActivityIndicator size="large" color={accent} /> : null}
-        <Text
-          className={`${failed ? "" : "mt-4"} text-center text-base text-foreground`}
-          style={{ fontFamily: MONO_FONT }}
-        >
-          {failed ? "Connection unavailable" : "Initializing…"}
-        </Text>
-        {transportError ? (
-          <Text
-            className="mt-3 max-w-md text-center text-xs leading-5 text-muted-foreground"
-            style={{ fontFamily: MONO_FONT }}
-          >
-            {transportError}
-          </Text>
-        ) : null}
-        <View className="mt-6 w-full max-w-xs gap-2.5">
-          {failed ? (
-            <TouchableOpacity
-              onPress={retryTransport}
-              className="items-center border border-accent-brand/40 bg-accent-brand/10 px-6 py-3"
-            >
-              <Text
-                className="text-accent-brand"
-                style={{ fontFamily: MONO_FONT_BOLD }}
-              >
-                Retry
-              </Text>
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity
-              onPress={cancelTransportRecovery}
-              className="items-center border border-border bg-card px-6 py-3"
-            >
-              <Text
-                className="text-foreground"
-                style={{ fontFamily: MONO_FONT_BOLD }}
-              >
-                Cancel attempt
-              </Text>
-            </TouchableOpacity>
-          )}
-          <TouchableOpacity
-            onPress={changeServer}
-            className="items-center border border-border bg-card px-6 py-3"
-          >
-            <Text
-              className="text-foreground"
-              style={{ fontFamily: MONO_FONT_BOLD }}
-            >
-              Change server
-            </Text>
-          </TouchableOpacity>
-        </View>
+  const transportStatusProps = {
+    failed: transportState === "failed",
+    accent,
+    transportError,
+    retryTransport,
+    cancelTransportRecovery,
+    changeServer,
+  };
+
+  if (!hasBootstrappedTransportRef.current) {
+    if (transportBlocked && authFlowVisible) {
+      return <AuthFlow />;
+    }
+    return <TransportStatusSurface {...transportStatusProps} />;
+  }
+
+  let foregroundOverlay: React.ReactNode = null;
+  if (transportBlocked) {
+    foregroundOverlay = authFlowVisible ? (
+      <View className="absolute inset-0 bg-background">
+        <AuthFlow />
+      </View>
+    ) : (
+      <TransportStatusSurface {...transportStatusProps} overlay />
+    );
+  } else if (showUpdateScreen) {
+    foregroundOverlay = (
+      <View className="absolute inset-0 bg-background">
+        <UpdateRequired />
+      </View>
+    );
+  } else if (authFlowVisible) {
+    foregroundOverlay = (
+      <View className="absolute inset-0 bg-background">
+        <AuthFlow />
       </View>
     );
   }
 
-  if (showUpdateScreen) return <UpdateRequired />;
-
-  // The tab shell always renders once loaded. When the user isn't connected,
-  // the tabs themselves show a "no server connected" empty state. The auth flow
-  // is layered on top as a dismissible full-screen overlay.
+  // Keep the tab shell mounted after the first successful transport. Later
+  // recovery, authentication, and update surfaces are opaque overlays so they
+  // cannot reset the active route or destroy terminal lifecycle state.
   return (
     <View className="flex-1 bg-background">
       <Stack screenOptions={{ headerShown: false }}>
         <Stack.Screen name="index" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       </Stack>
+      {foregroundOverlay}
       <AppLockGate />
-      {authFlowVisible ? (
-        <View className="absolute inset-0 bg-background">
-          <AuthFlow />
-        </View>
-      ) : null}
     </View>
   );
 }
