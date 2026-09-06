@@ -9,8 +9,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"tailscale.com/ipn/store/mem"
 )
 
 type fakeNode struct {
@@ -303,13 +301,36 @@ func TestCancelCurrentOperationCancelsRegisteredProbe(t *testing.T) {
 	}
 }
 
-func TestEphemeralNodeUsesMemoryStore(t *testing.T) {
-	durable := newTSNetServer(nodeConfig{stateDir: t.TempDir()})
-	if durable.Store != nil {
-		t.Fatalf("durable Store = %T; want tsnet file-store default", durable.Store)
+func TestNodeUsesPersistentStateStore(t *testing.T) {
+	stateDir := t.TempDir()
+	node := newTSNetServer(nodeConfig{stateDir: stateDir})
+	if node.Dir != stateDir {
+		t.Fatalf("node Dir = %q; want %q", node.Dir, stateDir)
 	}
-	ephemeral := newTSNetServer(nodeConfig{stateDir: t.TempDir(), ephemeral: true})
-	if _, ok := ephemeral.Store.(*mem.Store); !ok {
-		t.Fatalf("ephemeral Store = %T; want *mem.Store", ephemeral.Store)
+	if node.Store != nil {
+		t.Fatalf("node Store = %T; want tsnet file-store default", node.Store)
+	}
+	if node.Ephemeral {
+		t.Fatal("node is ephemeral; want persistent control-plane identity")
+	}
+}
+
+func TestConfigureRejectsEphemeralNode(t *testing.T) {
+	resetLifecycleForTest(t)
+	err := configureNode(nodeConfig{
+		authKey:   "tskey-auth-test",
+		hostname:  "termix-test",
+		stateDir:  t.TempDir(),
+		ephemeral: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "persistent identity") {
+		t.Fatalf("configureNode ephemeral error = %v; want persistent-identity rejection", err)
+	}
+
+	mu.Lock()
+	stillConfigured := configured
+	mu.Unlock()
+	if stillConfigured {
+		t.Fatal("ephemeral configure unexpectedly published native configuration")
 	}
 }

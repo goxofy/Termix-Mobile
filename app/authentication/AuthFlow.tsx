@@ -548,9 +548,9 @@ function ServerStep({
                   />
                 </View>
                 <Text className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
-                  Prefer a short-lived or one-off key. Stored in the device
-                  keychain. LAN IPs require an approved subnet route on your
-                  tailnet.
+                  Use a non-ephemeral short-lived or one-off key. Stored in the
+                  device keychain. LAN IPs require an approved subnet route on
+                  your tailnet.
                 </Text>
               </View>
               <View>

@@ -26,7 +26,6 @@ import (
 	"time"
 	"unsafe"
 
-	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tsnet"
 )
 
@@ -111,19 +110,14 @@ func (n *tsnetNode) TailscaleIPs() (netip.Addr, netip.Addr) {
 }
 
 func newTSNetServer(config nodeConfig) *tsnet.Server {
-	s := &tsnet.Server{
-		Hostname:  config.hostname,
-		AuthKey:   config.authKey,
-		Dir:       config.stateDir,
-		Ephemeral: config.ephemeral,
+	// Store intentionally stays nil: tsnet then persists the node identity in
+	// Dir/tailscaled.state and reuses the same control-plane device after a close,
+	// network rebuild, app update, or process restart.
+	return &tsnet.Server{
+		Hostname: config.hostname,
+		AuthKey:  config.authKey,
+		Dir:      config.stateDir,
 	}
-	if config.ephemeral {
-		// Ephemeral nodes must never recover an identity from tailscaled.state.
-		// Keeping the state in memory also guarantees every process launch uses
-		// the supplied reusable auth key instead of silently entering NeedsLogin.
-		s.Store = new(mem.Store)
-	}
-	return s
 }
 
 var nodeFactory = func(config nodeConfig) tailscaleNode {
@@ -239,10 +233,9 @@ var (
 	nextCancelableID      uint64
 	operationCancels      = map[uint64]context.CancelFunc{}
 
-	cfgAuthKey   string
-	cfgHostname  string
-	cfgStateDir  string
-	cfgEphemeral bool
+	cfgAuthKey  string
+	cfgHostname string
+	cfgStateDir string
 
 	// Variables rather than constants make the hard bounds injectable in tests.
 	upCallDeadline            = 90 * time.Second
@@ -258,7 +251,6 @@ func clearConfigLocked() {
 	cfgAuthKey = ""
 	cfgHostname = ""
 	cfgStateDir = ""
-	cfgEphemeral = false
 }
 
 func setErr(err error) {
@@ -282,6 +274,9 @@ func forwardKey(protocol, host string, remotePort, localPort int) string {
 }
 
 func configureNode(config nodeConfig) error {
+	if config.ephemeral {
+		return fmt.Errorf("ephemeral Tailscale nodes are unsupported; persistent identity is required")
+	}
 	config.hostname = strings.TrimSpace(config.hostname)
 	config.stateDir = strings.TrimSpace(config.stateDir)
 	if config.hostname == "" {
@@ -306,7 +301,6 @@ func configureNode(config nodeConfig) error {
 	cfgAuthKey = config.authKey
 	cfgHostname = config.hostname
 	cfgStateDir = config.stateDir
-	cfgEphemeral = config.ephemeral
 	configured = true
 
 	// On Android, $XDG_CACHE_HOME / $HOME are unset, so logpolicy's
@@ -480,10 +474,9 @@ func upNode() error {
 		return fmt.Errorf("tailscale is not configured")
 	}
 	config := nodeConfig{
-		authKey:   cfgAuthKey,
-		hostname:  cfgHostname,
-		stateDir:  cfgStateDir,
-		ephemeral: cfgEphemeral,
+		authKey:  cfgAuthKey,
+		hostname: cfgHostname,
+		stateDir: cfgStateDir,
 	}
 	route := currentRoute
 	mu.Unlock()

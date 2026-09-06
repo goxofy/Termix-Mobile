@@ -69,7 +69,6 @@ export type TailscaleLifecycleOptions = {
 type ActiveNodeConfig = {
   authKey: string;
   hostname: string;
-  ephemeral: boolean;
   networkGeneration: number;
 };
 
@@ -465,7 +464,6 @@ export type ConnectServerViaTailscaleOptions = TailscaleLifecycleOptions & {
   serverUrl: string;
   authKey: string;
   hostname?: string;
-  ephemeral?: boolean;
 };
 
 async function shutdownTailscaleUnsafe(signal: AbortSignal): Promise<void> {
@@ -521,14 +519,12 @@ async function connectServerViaTailscaleUnsafe(
   const desiredConfig: ActiveNodeConfig = {
     authKey,
     hostname: opts.hostname?.trim() || "termix-mobile",
-    ephemeral: opts.ephemeral ?? true,
     networkGeneration,
   };
   const configChanged =
     activeNodeConfig !== null &&
     (activeNodeConfig.authKey !== desiredConfig.authKey ||
       activeNodeConfig.hostname !== desiredConfig.hostname ||
-      activeNodeConfig.ephemeral !== desiredConfig.ephemeral ||
       activeNodeConfig.networkGeneration !== desiredConfig.networkGeneration);
 
   if (configChanged) {
@@ -803,7 +799,6 @@ export function recoverTailscaleTransport(
             serverUrl: parsed.original,
             authKey: settings.authKey,
             hostname: settings.hostname,
-            ephemeral: true,
             networkGeneration,
             signal,
           },

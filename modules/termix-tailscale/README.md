@@ -37,7 +37,9 @@ Higher-level helpers live in `app/utils/tailscaleConnect.ts` (auth key in Secure
 
 ## Auth
 
-Use a Tailscale **auth key** (`tskey-auth-…`), preferably one-off / short-lived / tagged. Do not embed reusable keys in the binary.
+Use a non-ephemeral Tailscale **auth key** (`tskey-auth-…`), preferably one-off / short-lived / tagged. Do not embed reusable keys in the binary.
+
+The embedded node is persistent, not ephemeral. Its identity is stored in the app-private `tailscaled.state` file and reused across network recovery, app updates, and process restarts. Uninstalling the app removes that local identity, so the next installation registers one new device.
 
 ## Notes
 

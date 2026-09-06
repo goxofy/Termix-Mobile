@@ -134,6 +134,10 @@ static NSString *TermixTSLastErrorString(void) {
                             withIntermediateDirectories:YES
                                              attributes:nil
                                                   error:nil];
+  NSURL *dirURL = [NSURL fileURLWithPath:dir isDirectory:YES];
+  [dirURL setResourceValue:@YES
+                    forKey:NSURLIsExcludedFromBackupKey
+                     error:NULL];
   return dir;
 }
 

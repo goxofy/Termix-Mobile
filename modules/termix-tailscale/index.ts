@@ -4,9 +4,8 @@ import type { EventSubscription } from "expo-modules-core";
 export type TermixTailscaleConfig = {
   authKey: string;
   hostname?: string;
-  /** Absolute path for tsnet state. Defaults to a native app-support path. */
+  /** Absolute path for persistent tsnet state. Defaults to app-private storage. */
   stateDir?: string;
-  ephemeral?: boolean;
 };
 
 export type NetworkSnapshot = {
@@ -132,7 +131,7 @@ export async function configureTermixTailscale(
     authKey: config.authKey.trim(),
     hostname: (config.hostname || "termix-mobile").trim(),
     stateDir,
-    ephemeral: !!config.ephemeral,
+    ephemeral: false,
   });
 }
 

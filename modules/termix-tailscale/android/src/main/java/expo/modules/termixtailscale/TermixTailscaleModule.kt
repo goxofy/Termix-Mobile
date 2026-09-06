@@ -26,6 +26,16 @@ class TermixTailscaleModule : Module() {
   private var hasNetworkSnapshot = false
   private var connectivityManager: ConnectivityManager? = null
 
+  private fun defaultStateDir(): String {
+    val context = appContext.reactContext
+      ?: throw Exception("No Android application context")
+    val dir = File(context.noBackupFilesDir, "TermixTailscale")
+    if (!dir.exists() && !dir.mkdirs()) {
+      throw Exception("Could not create the Tailscale state directory")
+    }
+    return dir.absolutePath
+  }
+
   private val networkCallback = object : ConnectivityManager.NetworkCallback() {
     override fun onAvailable(network: Network) = refreshNetworkSnapshot()
 
@@ -108,19 +118,14 @@ class TermixTailscaleModule : Module() {
     }
 
     AsyncFunction("getDefaultStateDir") {
-      val base = appContext.reactContext?.filesDir
-        ?: throw Exception("No Android filesDir")
-      val dir = File(base, "TermixTailscale")
-      if (!dir.exists()) dir.mkdirs()
-      dir.absolutePath
+      defaultStateDir()
     }
 
     AsyncFunction("configure") { options: Map<String, Any?> ->
       ensureLoaded()
       val authKey = options["authKey"] as? String ?: ""
       val hostname = options["hostname"] as? String ?: "termix-mobile"
-      val stateDir = options["stateDir"] as? String
-        ?: appContext.reactContext?.filesDir?.absolutePath ?: ""
+      val stateDir = options["stateDir"] as? String ?: defaultStateDir()
       val ephemeral = options["ephemeral"] as? Boolean ?: false
 
       val rc = nativeConfigure(authKey, hostname, stateDir, ephemeral)

@@ -25,7 +25,8 @@ void TermixTS_UpdateRoutePolicy(int policy, const char *physicalName,
 // Up/forward/probe operation. This function never waits for cleanup.
 void TermixTS_CancelCurrentOperation(void);
 
-// Configure before Up. stateDir must be a writable path. Returns 0 on success.
+// Configure before Up. stateDir must be a stable writable app-private path.
+// ephemeral must be 0; nonzero is rejected to prevent duplicate tailnet devices.
 int TermixTS_Configure(const char *authKey, const char *hostname,
                        const char *stateDir, int ephemeral);
 
