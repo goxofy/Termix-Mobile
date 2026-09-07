@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Stack } from "expo-router";
 import { AppProvider, useAppContext } from "./AppContext";
 import { TerminalSessionsProvider } from "./contexts/TerminalSessionsContext";
@@ -18,7 +18,7 @@ import {
   Text,
   ActivityIndicator,
   TouchableOpacity,
-  Platform,
+  AppState,
 } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -28,6 +28,8 @@ import { useFonts } from "expo-font";
 import { FONT_MAP, MONO_FONT, MONO_FONT_BOLD } from "./constants/fonts";
 import "../global.css";
 import UpdateRequired from "@/app/authentication/UpdateRequired";
+
+const RECOVERY_STATUS_DELAY_MS = 2_000;
 
 type TransportStatusSurfaceProps = {
   failed: boolean;
@@ -124,6 +126,8 @@ function RootLayoutContent() {
   } = useAppContext();
   const accent = useThemeColor()("accent-brand");
   const hasBootstrappedTransportRef = useRef(false);
+  const [appState, setAppState] = useState(AppState.currentState);
+  const [showRecoveryStatus, setShowRecoveryStatus] = useState(false);
   const transportBlocked = isLoading || transportState !== "ready";
 
   // Once a usable transport has mounted the app, keep the navigation tree alive
@@ -132,6 +136,35 @@ function RootLayoutContent() {
   if (!hasBootstrappedTransportRef.current && !transportBlocked) {
     hasBootstrappedTransportRef.current = true;
   }
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextAppState) => {
+      // A backgrounded app should receive a fresh grace period when it returns.
+      setShowRecoveryStatus(false);
+      setAppState(nextAppState);
+    });
+
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    if (
+      !hasBootstrappedTransportRef.current ||
+      appState !== "active" ||
+      transportState !== "recovering" ||
+      authFlowVisible
+    ) {
+      setShowRecoveryStatus(false);
+      return;
+    }
+
+    setShowRecoveryStatus(false);
+    const timeout = setTimeout(() => {
+      setShowRecoveryStatus(true);
+    }, RECOVERY_STATUS_DELAY_MS);
+
+    return () => clearTimeout(timeout);
+  }, [appState, authFlowVisible, transportState]);
 
   const transportStatusProps = {
     failed: transportState === "failed",
@@ -155,10 +188,10 @@ function RootLayoutContent() {
       <View className="absolute inset-0 bg-background">
         <AuthFlow />
       </View>
-    ) : Platform.OS === "ios" && transportState === "recovering" ? (
-      // Keep the current screen visible during ordinary iOS foreground recovery.
-      // This transparent layer blocks touches until the transport request barrier
-      // is released; terminal input is independently paused by its manager.
+    ) : transportState === "recovering" && !showRecoveryStatus ? (
+      // Keep short foreground recovery invisible. After the grace period, the
+      // regular status surface replaces this interaction-blocking transparent layer.
+      // Terminal input is independently paused by its manager.
       <View
         className="absolute inset-0"
         pointerEvents="auto"
@@ -182,8 +215,8 @@ function RootLayoutContent() {
   }
 
   // Keep the tab shell mounted after the first successful transport. Later
-  // recovery uses a platform-appropriate interaction gate, while authentication
-  // and update surfaces remain opaque overlays; none can reset the active route.
+  // recovery starts with a transparent interaction gate and only reveals its status
+  // after a grace period; none of these overlays can reset the active route.
   return (
     <View className="flex-1 bg-background">
       <Stack screenOptions={{ headerShown: false }}>
