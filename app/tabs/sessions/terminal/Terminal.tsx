@@ -16,7 +16,8 @@ import {
   type LayoutChangeEvent,
 } from "react-native";
 import { WebView } from "react-native-webview";
-import { ChevronDown } from "lucide-react-native";
+import * as Clipboard from "expo-clipboard";
+import { ChevronDown, ClipboardPaste, Copy } from "lucide-react-native";
 import { logActivity, getSnippets } from "../../../main-axios";
 import { showToast } from "../../../utils/toast";
 import { useTerminalCustomization } from "../../../contexts/TerminalCustomizationContext";
@@ -41,6 +42,7 @@ import {
   type HostKeyData,
 } from "./NativeWebSocketManager";
 import { loadXtermAssets } from "./loadXtermAssets";
+import { ContextSheet } from "../_shared";
 import { useConnectionLog, ConnectionLog } from "../_shared/useConnectionLog";
 
 interface TerminalProps {
@@ -118,6 +120,9 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     const dataFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
       null,
     );
+    const terminalContextReleaseTimerRef = useRef<ReturnType<
+      typeof setTimeout
+    > | null>(null);
 
     const { config } = useTerminalCustomization();
     const log = useConnectionLog();
@@ -152,6 +157,14 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       securityKey: string;
     } | null>(null);
     const [isSelecting, setIsSelecting] = useState(false);
+    const [terminalContextMenuVisible, setTerminalContextMenuVisible] =
+      useState(false);
+    const [
+      terminalContextInteractionActive,
+      setTerminalContextInteractionActive,
+    ] = useState(false);
+    const [terminalContextSelection, setTerminalContextSelection] =
+      useState("");
     const [showScrollToBottomButton, setShowScrollToBottomButton] =
       useState(false);
     const [hostKeyVerification, setHostKeyVerification] = useState<{
@@ -556,6 +569,12 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       scheduleScrollStateUpdate();
     }
 
+    window.clearTerminalSelection = function() {
+      try {
+        terminal.clearSelection();
+      } catch(e) {}
+    }
+
     document.addEventListener('focusin', function(e) {
       if (e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) {
         e.preventDefault();
@@ -589,58 +608,71 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     let selectionEndTimeout = null;
     let isCurrentlySelecting = false;
     let lastInteractionTime = Date.now();
-    let touchStartTime = 0;
     let touchStartX = 0;
     let touchStartY = 0;
     let hasMoved = false;
     let longPressTimeout = null;
+    let longPressTriggered = false;
+
+    function cancelLongPress() {
+      if (longPressTimeout) {
+        clearTimeout(longPressTimeout);
+        longPressTimeout = null;
+      }
+      longPressTriggered = false;
+    }
+
+    function postTerminalContextMenu(selection) {
+      if (!window.ReactNativeWebView) return;
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'terminalContextMenu',
+        data: { selection: selection || '' }
+      }));
+    }
 
     terminalElement.addEventListener('touchstart', (e) => {
       lastInteractionTime = Date.now();
-      touchStartTime = Date.now();
       hasMoved = false;
+      cancelLongPress();
 
-      if (e.touches && e.touches.length > 0) {
-        touchStartX = e.touches[0].clientX;
-        touchStartY = e.touches[0].clientY;
+      if (!e.touches || e.touches.length !== 1) {
+        return;
       }
 
-      if (longPressTimeout) {
-        clearTimeout(longPressTimeout);
-      }
-
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
       longPressTimeout = setTimeout(() => {
+        longPressTimeout = null;
         if (!hasMoved) {
-          if (!isCurrentlySelecting) {
-            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'selectionStart', data: {} }));
-            isCurrentlySelecting = true;
-          }
+          longPressTriggered = true;
         }
       }, 350);
     }, { passive: true });
 
     terminalElement.addEventListener('touchmove', (e) => {
-      if (e.touches && e.touches.length > 0) {
-        const deltaX = Math.abs(e.touches[0].clientX - touchStartX);
-        const deltaY = Math.abs(e.touches[0].clientY - touchStartY);
+      if (!e.touches || e.touches.length !== 1) {
+        hasMoved = true;
+        cancelLongPress();
+        return;
+      }
 
-        if (deltaX > 10 || deltaY > 10) {
-          hasMoved = true;
-          if (longPressTimeout) {
-            clearTimeout(longPressTimeout);
-            longPressTimeout = null;
-          }
+      const deltaX = Math.abs(e.touches[0].clientX - touchStartX);
+      const deltaY = Math.abs(e.touches[0].clientY - touchStartY);
+
+      if (deltaX > 10 || deltaY > 10) {
+        hasMoved = true;
+        // A drag that starts after the hold threshold is a text-selection
+        // gesture. Keep the long-press state alive so the scroll handler leaves
+        // the gesture to xterm, but suppress the action menu on touchend.
+        if (!longPressTriggered) {
+          cancelLongPress();
         }
       }
     }, { passive: true });
 
     terminalElement.addEventListener('touchend', () => {
-      if (longPressTimeout) {
-        clearTimeout(longPressTimeout);
-        longPressTimeout = null;
-      }
-
-      const touchDuration = Date.now() - touchStartTime;
+      const shouldShowContextMenu = longPressTriggered && !hasMoved;
+      cancelLongPress();
 
       setTimeout(() => {
         const selection = terminal.getSelection();
@@ -652,12 +684,21 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
             isCurrentlySelecting = true;
             window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'selectionStart', data: {} }));
           }
-        } else if (!isCurrentlySelecting && (touchDuration < 350 || hasMoved)) {
+        } else {
           lastInteractionTime = Date.now();
           checkIfDoneSelecting();
         }
+
+        if (shouldShowContextMenu) {
+          postTerminalContextMenu(selection);
+        }
       }, 100);
     });
+
+    terminalElement.addEventListener('touchcancel', () => {
+      hasMoved = true;
+      cancelLongPress();
+    }, { passive: true });
 
     terminalElement.addEventListener('mousedown', (e) => {
       lastInteractionTime = Date.now();
@@ -794,9 +835,9 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       }, { passive: true, capture: true });
       terminalElement.addEventListener('touchmove', function(e) {
         if (scrollTouchY === null || e.touches.length !== 1) return;
-        // While the user is text-selecting, leave the gesture alone so xterm's
-        // selection drag can track the finger.
-        if (typeof isCurrentlySelecting !== 'undefined' && isCurrentlySelecting) {
+        // While a hold or an active text selection owns the gesture, leave it
+        // alone so xterm's selection drag can track the finger.
+        if (longPressTriggered || isCurrentlySelecting) {
           return;
         }
         // Claim the gesture so WKWebView / Android WebView do not scroll the
@@ -956,6 +997,90 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       }, 80);
     }, []);
 
+    const clearTerminalSelection = useCallback(() => {
+      try {
+        webViewRef.current?.injectJavaScript(
+          `window.clearTerminalSelection && window.clearTerminalSelection(); true;`,
+        );
+      } catch {}
+    }, []);
+
+    const holdTerminalContextInteraction = useCallback(() => {
+      if (terminalContextReleaseTimerRef.current) {
+        clearTimeout(terminalContextReleaseTimerRef.current);
+        terminalContextReleaseTimerRef.current = null;
+      }
+      setTerminalContextInteractionActive(true);
+    }, []);
+
+    const releaseTerminalContextInteraction = useCallback((delay = 0) => {
+      if (terminalContextReleaseTimerRef.current) {
+        clearTimeout(terminalContextReleaseTimerRef.current);
+        terminalContextReleaseTimerRef.current = null;
+      }
+
+      if (delay > 0) {
+        terminalContextReleaseTimerRef.current = setTimeout(() => {
+          terminalContextReleaseTimerRef.current = null;
+          setTerminalContextInteractionActive(false);
+        }, delay);
+      } else {
+        setTerminalContextInteractionActive(false);
+      }
+    }, []);
+
+    const closeTerminalContextMenu = useCallback(() => {
+      setTerminalContextMenuVisible(false);
+      setTerminalContextSelection("");
+      // ContextSheet defers actions until the next frame. Keep this active
+      // across that gap so Sessions does not restore the keyboard first.
+      releaseTerminalContextInteraction(100);
+    }, [releaseTerminalContextInteraction]);
+
+    const handleContextMenuPaste = useCallback(async () => {
+      holdTerminalContextInteraction();
+      try {
+        const clipboardContent = await Clipboard.getStringAsync();
+        if (!clipboardContent) {
+          showToast.info("Clipboard is empty");
+          return;
+        }
+
+        clearTerminalSelection();
+        wsManagerRef.current?.sendInput(clipboardContent);
+      } catch {
+        showToast.error("Unable to read the clipboard");
+      } finally {
+        releaseTerminalContextInteraction();
+      }
+    }, [
+      clearTerminalSelection,
+      holdTerminalContextInteraction,
+      releaseTerminalContextInteraction,
+    ]);
+
+    const handleContextMenuCopy = useCallback(
+      async (selection: string) => {
+        if (!selection) return;
+
+        holdTerminalContextInteraction();
+        try {
+          await Clipboard.setStringAsync(selection);
+          clearTerminalSelection();
+          showToast.success("Selection copied");
+        } catch {
+          showToast.error("Unable to copy the selection");
+        } finally {
+          releaseTerminalContextInteraction();
+        }
+      },
+      [
+        clearTerminalSelection,
+        holdTerminalContextInteraction,
+        releaseTerminalContextInteraction,
+      ],
+    );
+
     const handleWebViewMessage = useCallback((event: any) => {
       try {
         const message = JSON.parse(event.nativeEvent.data);
@@ -991,6 +1116,16 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
             setIsSelecting(false);
             break;
 
+          case "terminalContextMenu":
+            holdTerminalContextInteraction();
+            setTerminalContextSelection(
+              typeof message.data?.selection === "string"
+                ? message.data.selection
+                : "",
+            );
+            setTerminalContextMenuVisible(true);
+            break;
+
           case "scrollState":
             setShowScrollToBottomButton(!message.data.isAtBottom);
             break;
@@ -1004,7 +1139,7 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       } catch (error) {
         console.error("[Terminal] Error parsing WebView message:", error);
       }
-    }, []);
+    }, [holdTerminalContextInteraction]);
 
     useEffect(() => {
       wsManagerRef.current?.destroy();
@@ -1109,7 +1244,15 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       setConnectionState("connecting");
       setHasReceivedData(false);
       setRetryCount(0);
+      setIsSelecting(false);
       setShowScrollToBottomButton(false);
+      if (terminalContextReleaseTimerRef.current) {
+        clearTimeout(terminalContextReleaseTimerRef.current);
+        terminalContextReleaseTimerRef.current = null;
+      }
+      setTerminalContextMenuVisible(false);
+      setTerminalContextInteractionActive(false);
+      setTerminalContextSelection("");
       // Clear any stale auth/verification dialogs from a previous connection attempt.
       setHostKeyVerification(null);
       setTotpRequired(false);
@@ -1139,6 +1282,10 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
           clearTimeout(viewportDebounceTimerRef.current);
           viewportDebounceTimerRef.current = null;
         }
+        if (terminalContextReleaseTimerRef.current) {
+          clearTimeout(terminalContextReleaseTimerRef.current);
+          terminalContextReleaseTimerRef.current = null;
+        }
       };
     }, []);
 
@@ -1161,7 +1308,9 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
             showAuthDialog ||
             hostKeyVerification !== null ||
             passphraseRequired ||
-            warpgateAuth !== null
+            warpgateAuth !== null ||
+            terminalContextMenuVisible ||
+            terminalContextInteractionActive
           );
         },
         notifyBackgrounded: () => {
@@ -1179,10 +1328,23 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
           } catch (e) {}
         },
         isSelecting: () => {
-          return isSelecting;
+          return (
+            isSelecting ||
+            terminalContextMenuVisible ||
+            terminalContextInteractionActive
+          );
         },
       }),
-      [totpRequired, showAuthDialog, hostKeyVerification, isSelecting],
+      [
+        totpRequired,
+        showAuthDialog,
+        hostKeyVerification,
+        passphraseRequired,
+        warpgateAuth,
+        terminalContextMenuVisible,
+        terminalContextInteractionActive,
+        isSelecting,
+      ],
     );
 
     return (
@@ -1380,6 +1542,29 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
             }}
           />
         )}
+
+        <ContextSheet
+          visible={terminalContextMenuVisible}
+          onClose={closeTerminalContextMenu}
+          title="Terminal actions"
+          actions={[
+            {
+              key: "paste",
+              icon: <ClipboardPaste size={18} color={ACCENT} />,
+              label: "Paste from Clipboard",
+              onPress: handleContextMenuPaste,
+            },
+            terminalContextSelection
+              ? {
+                  key: "copy",
+                  icon: <Copy size={18} color={TEXT_COLORS.PRIMARY} />,
+                  label: "Copy Selection",
+                  onPress: () =>
+                    handleContextMenuCopy(terminalContextSelection),
+                }
+              : null,
+          ]}
+        />
 
         <TOTPDialog
           visible={totpRequired}
