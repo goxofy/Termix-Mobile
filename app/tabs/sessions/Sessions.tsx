@@ -546,6 +546,15 @@ export default function Sessions() {
     ]),
   );
 
+  const handleTerminalKeyboardRequest = useCallback(() => {
+    if (isCustomKeyboardVisible) return;
+
+    setKeyboardIntentionallyHidden(false);
+    setTimeout(() => {
+      hiddenInputRef.current?.focus();
+    }, 100);
+  }, [isCustomKeyboardVisible, setKeyboardIntentionallyHidden]);
+
   const handleTabPress = (sessionId: string) => {
     const session = sessions.find((s) => s.id === sessionId);
     setKeyboardIntentionallyHidden(false);
@@ -714,6 +723,7 @@ export default function Sessions() {
                 onSessionIdChange={(backendId) =>
                   setBackendSessionId(session.id, backendId)
                 }
+                onRequestKeyboard={handleTerminalKeyboardRequest}
                 onClose={() => handleTabClose(session.id)}
                 onBackgroundColorChange={(color) => {
                   setTerminalBackgroundColors((prev) => ({

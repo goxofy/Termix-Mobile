@@ -73,6 +73,8 @@ interface TerminalProps {
   initialSessionId?: string | null;
   /** Fired when the backend session id is created/attached/cleared. */
   onSessionIdChange?: (sessionId: string | null) => void;
+  /** Requests focus for the native terminal IME after a plain terminal tap. */
+  onRequestKeyboard?: () => void;
 }
 
 export type TerminalHandle = {
@@ -96,6 +98,7 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       tabInstanceId,
       initialSessionId,
       onSessionIdChange,
+      onRequestKeyboard,
     },
     ref,
   ) => {
@@ -448,7 +451,7 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       screenReaderMode: true,
       windowsMode: false,
       macOptionIsMeta: false,
-      macOptionClickForcesSelection: false,
+      macOptionClickForcesSelection: true,
       rightClickSelectsWord: false,
       fastScrollModifier: 'alt',
       fastScrollSensitivity: 5,
@@ -610,17 +613,15 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     let lastInteractionTime = Date.now();
     let touchStartX = 0;
     let touchStartY = 0;
+    let lastTouchX = 0;
+    let lastTouchY = 0;
+    let scrollTouchY = null;
+    let pendingScrollLines = 0;
     let hasMoved = false;
     let longPressTimeout = null;
-    let longPressTriggered = false;
-
-    function cancelLongPress() {
-      if (longPressTimeout) {
-        clearTimeout(longPressTimeout);
-        longPressTimeout = null;
-      }
-      longPressTriggered = false;
-    }
+    let selectionGestureActive = false;
+    let touchStartedInSelection = false;
+    const touchScrollLineHeight = terminal._core._renderService.dimensions.css.cell.height || ${baseFontSize * 1.2};
 
     function postTerminalContextMenu(selection) {
       if (!window.ReactNativeWebView) return;
@@ -630,77 +631,272 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       }));
     }
 
-    terminalElement.addEventListener('touchstart', (e) => {
-      lastInteractionTime = Date.now();
-      hasMoved = false;
-      cancelLongPress();
+    function postTerminalKeyboardRequest() {
+      if (!window.ReactNativeWebView) return;
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'terminalTap',
+        data: {}
+      }));
+    }
 
-      if (!e.touches || e.touches.length !== 1) {
+    function postSelectionStart() {
+      if (!window.ReactNativeWebView || isCurrentlySelecting) return;
+      isCurrentlySelecting = true;
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'selectionStart',
+        data: {}
+      }));
+    }
+
+    function postSelectionEnd() {
+      if (!window.ReactNativeWebView || !isCurrentlySelecting) return;
+      isCurrentlySelecting = false;
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'selectionEnd',
+        data: {}
+      }));
+    }
+
+    function cancelLongPress() {
+      if (longPressTimeout) {
+        clearTimeout(longPressTimeout);
+        longPressTimeout = null;
+      }
+    }
+
+    function getBufferCellAt(clientX, clientY) {
+      const screen = terminal.element && terminal.element.querySelector('.xterm-screen');
+      const cell = terminal._core._renderService.dimensions.css.cell;
+      if (!screen || !cell || !cell.width || !cell.height) return null;
+
+      const rect = screen.getBoundingClientRect();
+      if (
+        clientX < rect.left ||
+        clientX >= rect.right ||
+        clientY < rect.top ||
+        clientY >= rect.bottom
+      ) {
+        return null;
+      }
+
+      return {
+        x: Math.max(0, Math.min(terminal.cols - 1, Math.floor((clientX - rect.left) / cell.width))),
+        y: terminal.buffer.active.viewportY + Math.max(
+          0,
+          Math.min(terminal.rows - 1, Math.floor((clientY - rect.top) / cell.height))
+        )
+      };
+    }
+
+    function isPointInSelection(clientX, clientY) {
+      const position = terminal.getSelectionPosition();
+      const cell = getBufferCellAt(clientX, clientY);
+      if (!position || !cell) return false;
+
+      const start = position.start;
+      const end = position.end;
+      return (
+        (cell.y > start.y && cell.y < end.y) ||
+        (start.y === end.y && cell.y === start.y && cell.x >= start.x && cell.x < end.x) ||
+        (start.y < end.y && cell.y === end.y && cell.x < end.x) ||
+        (start.y < end.y && cell.y === start.y && cell.x >= start.x)
+      );
+    }
+
+    function dispatchSelectionMouseEvent(type, clientX, clientY, detail) {
+      const mouseReportingActive = !!(
+        terminal.element && terminal.element.classList.contains('enable-mouse-events')
+      );
+      const isMacPlatform = [
+        'Macintosh',
+        'MacIntel',
+        'MacPPC',
+        'Mac68K'
+      ].indexOf(navigator.platform) !== -1;
+      const event = new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: clientX,
+        clientY: clientY,
+        button: 0,
+        buttons: type === 'mouseup' ? 0 : 1,
+        detail: detail || 1,
+        shiftKey: mouseReportingActive && !isMacPlatform,
+        altKey: mouseReportingActive && isMacPlatform
+      });
+
+      if (type === 'mousedown') {
+        terminal.element.dispatchEvent(event);
+      } else {
+        document.dispatchEvent(event);
+      }
+    }
+
+    function beginTouchSelection() {
+      longPressTimeout = null;
+      if (hasMoved || touchStartedInSelection) return;
+
+      selectionGestureActive = true;
+      lastInteractionTime = Date.now();
+      // detail=2 starts with the word under the finger selected, then xterm's
+      // own mousemove handling extends that selection while the finger drags.
+      dispatchSelectionMouseEvent('mousedown', touchStartX, touchStartY, 2);
+      postSelectionStart();
+    }
+
+    function finishTouchSelection() {
+      if (!selectionGestureActive) return;
+
+      dispatchSelectionMouseEvent('mouseup', lastTouchX, lastTouchY, 1);
+      selectionGestureActive = false;
+      lastInteractionTime = Date.now();
+
+      if (terminal.hasSelection()) {
+        postSelectionStart();
+      } else {
+        postSelectionEnd();
+      }
+    }
+
+    // Keep touch scrolling routed through xterm so normal scrollback and
+    // alternate-screen TUI mouse/key reporting continue to work.
+    function dispatchTouchScroll(clientY) {
+      if (scrollTouchY === null) {
+        scrollTouchY = clientY;
         return;
       }
 
-      touchStartX = e.touches[0].clientX;
-      touchStartY = e.touches[0].clientY;
-      longPressTimeout = setTimeout(() => {
-        longPressTimeout = null;
-        if (!hasMoved) {
-          longPressTriggered = true;
-        }
-      }, 350);
-    }, { passive: true });
+      const dy = scrollTouchY - clientY;
+      scrollTouchY = clientY;
+      pendingScrollLines += dy / touchScrollLineHeight;
+      const wholeLines = Math.trunc(pendingScrollLines);
+      if (wholeLines === 0) return;
+
+      pendingScrollLines -= wholeLines;
+      try {
+        terminal.element.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: wholeLines,
+          deltaMode: WheelEvent.DOM_DELTA_LINE,
+          cancelable: true
+        }));
+      } catch(e) {}
+    }
+
+    function resetTouchGesture() {
+      cancelLongPress();
+      hasMoved = false;
+      touchStartedInSelection = false;
+      scrollTouchY = null;
+      pendingScrollLines = 0;
+    }
+
+    terminalElement.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      lastInteractionTime = Date.now();
+      finishTouchSelection();
+      resetTouchGesture();
+
+      if (!e.touches || e.touches.length !== 1) {
+        hasMoved = true;
+        return;
+      }
+
+      const touch = e.touches[0];
+      touchStartX = touch.clientX;
+      touchStartY = touch.clientY;
+      lastTouchX = touch.clientX;
+      lastTouchY = touch.clientY;
+      scrollTouchY = touch.clientY;
+      touchStartedInSelection = isPointInSelection(touch.clientX, touch.clientY);
+
+      if (!touchStartedInSelection) {
+        longPressTimeout = setTimeout(beginTouchSelection, 350);
+      }
+    }, { passive: false, capture: true });
 
     terminalElement.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+
       if (!e.touches || e.touches.length !== 1) {
         hasMoved = true;
         cancelLongPress();
+        finishTouchSelection();
         return;
       }
 
-      const deltaX = Math.abs(e.touches[0].clientX - touchStartX);
-      const deltaY = Math.abs(e.touches[0].clientY - touchStartY);
+      const touch = e.touches[0];
+      lastTouchX = touch.clientX;
+      lastTouchY = touch.clientY;
+      const deltaX = Math.abs(touch.clientX - touchStartX);
+      const deltaY = Math.abs(touch.clientY - touchStartY);
 
       if (deltaX > 10 || deltaY > 10) {
         hasMoved = true;
-        // A drag that starts after the hold threshold is a text-selection
-        // gesture. Keep the long-press state alive so the scroll handler leaves
-        // the gesture to xterm, but suppress the action menu on touchend.
-        if (!longPressTriggered) {
+        if (!selectionGestureActive) {
           cancelLongPress();
         }
       }
-    }, { passive: true });
 
-    terminalElement.addEventListener('touchend', () => {
-      const shouldShowContextMenu = longPressTriggered && !hasMoved;
+      if (selectionGestureActive) {
+        dispatchSelectionMouseEvent('mousemove', touch.clientX, touch.clientY, 1);
+      } else if (hasMoved) {
+        dispatchTouchScroll(touch.clientY);
+      }
+    }, { passive: false, capture: true });
+
+    terminalElement.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
       cancelLongPress();
 
-      setTimeout(() => {
+      const touch = e.changedTouches && e.changedTouches[0];
+      if (touch) {
+        lastTouchX = touch.clientX;
+        lastTouchY = touch.clientY;
+      }
+
+      if (e.touches && e.touches.length > 0) {
+        hasMoved = true;
+        finishTouchSelection();
+        return;
+      }
+
+      if (selectionGestureActive) {
+        finishTouchSelection();
+      } else if (!hasMoved) {
         const selection = terminal.getSelection();
-        const hasSelection = selection && selection.length > 0;
-
-        if (hasSelection) {
-          lastInteractionTime = Date.now();
-          if (!isCurrentlySelecting) {
-            isCurrentlySelecting = true;
-            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'selectionStart', data: {} }));
-          }
-        } else {
-          lastInteractionTime = Date.now();
-          checkIfDoneSelecting();
-        }
-
-        if (shouldShowContextMenu) {
+        if (
+          selection &&
+          touchStartedInSelection &&
+          isPointInSelection(lastTouchX, lastTouchY)
+        ) {
           postTerminalContextMenu(selection);
+        } else {
+          if (terminal.hasSelection()) {
+            terminal.clearSelection();
+          }
+          postSelectionEnd();
+          postTerminalKeyboardRequest();
         }
-      }, 100);
-    });
+      }
 
-    terminalElement.addEventListener('touchcancel', () => {
+      resetTouchGesture();
+    }, { passive: false, capture: true });
+
+    terminalElement.addEventListener('touchcancel', (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      // Keep this gesture blocked until the next touchstart so a stray touchend
+      // after cancellation cannot be mistaken for a plain tap.
       hasMoved = true;
       cancelLongPress();
-    }, { passive: true });
+      finishTouchSelection();
+    }, { passive: false, capture: true });
 
-    terminalElement.addEventListener('mousedown', (e) => {
+    terminalElement.addEventListener('mousedown', () => {
       lastInteractionTime = Date.now();
     });
 
@@ -719,15 +915,11 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
         const hasSelection = selection && selection.length > 0;
 
         if (hasSelection) {
-          if (!isCurrentlySelecting) {
-            isCurrentlySelecting = true;
-            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'selectionStart', data: {} }));
-          }
+          postSelectionStart();
         } else if (isCurrentlySelecting) {
           const timeSinceLastInteraction = Date.now() - lastInteractionTime;
           if (timeSinceLastInteraction >= 150) {
-            isCurrentlySelecting = false;
-            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'selectionEnd', data: {} }));
+            postSelectionEnd();
           } else {
             checkIfDoneSelecting();
           }
@@ -741,10 +933,7 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
 
       if (hasSelection) {
         lastInteractionTime = Date.now();
-        if (!isCurrentlySelecting) {
-          isCurrentlySelecting = true;
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'selectionStart', data: {} }));
-        }
+        postSelectionStart();
       } else if (isCurrentlySelecting) {
         lastInteractionTime = Date.now();
         checkIfDoneSelecting();
@@ -816,53 +1005,6 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     window.addEventListener('orientationchange', function() {
       setTimeout(handleResize, 100);
     });
-
-    // Touch-scroll for both the normal scrollback and TUI alternate-screen
-    // buffers. Instead of calling terminal.scrollLines() (which is a no-op on
-    // the alt buffer that Claude Code / Codex run in), synthesize a wheel
-    // event on the xterm root element: xterm then routes it either to the
-    // scrollback (normal buffer) or to SGR mouse / arrow-key sequences the TUI
-    // understands (alternate buffer with/without mouse tracking).
-    // touchmove is non-passive so we can preventDefault and stop the native
-    // WebView/page from hijacking the swipe (especially up-swipe when the
-    // alt buffer is already at its top).
-    (function() {
-      var scrollTouchY = null;
-      var pendingLines = 0;
-      var lineH = terminal._core._renderService.dimensions.css.cell.height || ${baseFontSize * 1.2};
-      terminalElement.addEventListener('touchstart', function(e) {
-        if (e.touches.length === 1) scrollTouchY = e.touches[0].clientY;
-      }, { passive: true, capture: true });
-      terminalElement.addEventListener('touchmove', function(e) {
-        if (scrollTouchY === null || e.touches.length !== 1) return;
-        // While a hold or an active text selection owns the gesture, leave it
-        // alone so xterm's selection drag can track the finger.
-        if (longPressTriggered || isCurrentlySelecting) {
-          return;
-        }
-        // Claim the gesture so WKWebView / Android WebView do not scroll the
-        // whole page when the terminal content cannot scroll further.
-        try { e.preventDefault(); } catch(e3) {}
-        var dy = scrollTouchY - e.touches[0].clientY;
-        scrollTouchY = e.touches[0].clientY;
-        pendingLines += dy / lineH;
-        var whole = Math.trunc(pendingLines);
-        if (whole !== 0) {
-          pendingLines -= whole;
-          try {
-            terminal.element.dispatchEvent(new WheelEvent('wheel', {
-              deltaY: whole,
-              deltaMode: WheelEvent.DOM_DELTA_LINE,
-              cancelable: true
-            }));
-          } catch(e2) {}
-        }
-      }, { passive: false, capture: true });
-      terminalElement.addEventListener('touchend', function() {
-        scrollTouchY = null;
-        pendingLines = 0;
-      }, { passive: true, capture: true });
-    })();
 
     terminal.clear();
     terminal.reset();
@@ -1081,65 +1223,75 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       ],
     );
 
-    const handleWebViewMessage = useCallback((event: any) => {
-      try {
-        const message = JSON.parse(event.nativeEvent.data);
+    const handleWebViewMessage = useCallback(
+      (event: any) => {
+        try {
+          const message = JSON.parse(event.nativeEvent.data);
 
-        switch (message.type) {
-          case "terminalReady":
-            terminalColsRef.current = message.data.cols;
-            terminalRowsRef.current = message.data.rows;
-            // Re-apply the RN-measured viewport height now that the terminal
-            // exists — onLayout may have fired before the HTML finished loading.
-            if (viewportHeightRef.current) {
-              webViewRef.current?.injectJavaScript(
-                `window.setTerminalViewportHeight && window.setTerminalViewportHeight(${viewportHeightRef.current}); true;`,
+          switch (message.type) {
+            case "terminalReady":
+              terminalColsRef.current = message.data.cols;
+              terminalRowsRef.current = message.data.rows;
+              // Re-apply the RN-measured viewport height now that the terminal
+              // exists — onLayout may have fired before the HTML finished loading.
+              if (viewportHeightRef.current) {
+                webViewRef.current?.injectJavaScript(
+                  `window.setTerminalViewportHeight && window.setTerminalViewportHeight(${viewportHeightRef.current}); true;`,
+                );
+              }
+              wsManagerRef.current?.connect(
+                message.data.cols,
+                message.data.rows,
               );
-            }
-            wsManagerRef.current?.connect(message.data.cols, message.data.rows);
-            break;
+              break;
 
-          case "resize":
-            terminalColsRef.current = message.data.cols;
-            terminalRowsRef.current = message.data.rows;
-            wsManagerRef.current?.sendResize(
-              message.data.cols,
-              message.data.rows,
-            );
-            break;
+            case "resize":
+              terminalColsRef.current = message.data.cols;
+              terminalRowsRef.current = message.data.rows;
+              wsManagerRef.current?.sendResize(
+                message.data.cols,
+                message.data.rows,
+              );
+              break;
 
-          case "selectionStart":
-            setIsSelecting(true);
-            break;
+            case "selectionStart":
+              setIsSelecting(true);
+              break;
 
-          case "selectionEnd":
-            setIsSelecting(false);
-            break;
+            case "selectionEnd":
+              setIsSelecting(false);
+              break;
 
-          case "terminalContextMenu":
-            holdTerminalContextInteraction();
-            setTerminalContextSelection(
-              typeof message.data?.selection === "string"
-                ? message.data.selection
-                : "",
-            );
-            setTerminalContextMenuVisible(true);
-            break;
+            case "terminalContextMenu":
+              holdTerminalContextInteraction();
+              setTerminalContextSelection(
+                typeof message.data?.selection === "string"
+                  ? message.data.selection
+                  : "",
+              );
+              setTerminalContextMenuVisible(true);
+              break;
 
-          case "scrollState":
-            setShowScrollToBottomButton(!message.data.isAtBottom);
-            break;
+            case "terminalTap":
+              onRequestKeyboard?.();
+              break;
 
-          case "input":
-            // Wheel/mouse input synthesized inside the WebView (xterm onData),
-            // forwarded to the pty so TUI apps can scroll their context.
-            wsManagerRef.current?.sendInput(message.data);
-            break;
+            case "scrollState":
+              setShowScrollToBottomButton(!message.data.isAtBottom);
+              break;
+
+            case "input":
+              // Wheel/mouse input synthesized inside the WebView (xterm onData),
+              // forwarded to the pty so TUI apps can scroll their context.
+              wsManagerRef.current?.sendInput(message.data);
+              break;
+          }
+        } catch (error) {
+          console.error("[Terminal] Error parsing WebView message:", error);
         }
-      } catch (error) {
-        console.error("[Terminal] Error parsing WebView message:", error);
-      }
-    }, [holdTerminalContextInteraction]);
+      },
+      [holdTerminalContextInteraction, onRequestKeyboard],
+    );
 
     useEffect(() => {
       wsManagerRef.current?.destroy();
@@ -1548,12 +1700,6 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
           onClose={closeTerminalContextMenu}
           title="Terminal actions"
           actions={[
-            {
-              key: "paste",
-              icon: <ClipboardPaste size={18} color={ACCENT} />,
-              label: "Paste from Clipboard",
-              onPress: handleContextMenuPaste,
-            },
             terminalContextSelection
               ? {
                   key: "copy",
@@ -1563,6 +1709,12 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
                     handleContextMenuCopy(terminalContextSelection),
                 }
               : null,
+            {
+              key: "paste",
+              icon: <ClipboardPaste size={18} color={ACCENT} />,
+              label: "Paste from Clipboard",
+              onPress: handleContextMenuPaste,
+            },
           ]}
         />
 
