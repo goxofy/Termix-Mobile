@@ -4,7 +4,6 @@ import {
   Text,
   TouchableOpacity,
   ScrollView,
-  Keyboard,
   StyleSheet,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -37,7 +36,6 @@ import {
   ACCENT,
   TEXT_COLORS,
 } from "@/app/constants/designTokens";
-import type { TerminalImeInputHandle } from "@/modules/terminal-ime-input";
 
 function getSessionIcon(type: SessionType) {
   switch (type) {
@@ -64,10 +62,9 @@ interface TabBarProps {
   onAddSession?: () => void;
   onToggleKeyboard?: () => void;
   isCustomKeyboardVisible: boolean;
-  hiddenInputRef: React.RefObject<TerminalImeInputHandle | null>;
+  isKeyboardIntentionallyHidden: boolean;
   onHideKeyboard?: () => void;
   onShowKeyboard?: () => void;
-  keyboardIntentionallyHiddenRef: React.MutableRefObject<boolean>;
   activeSessionType?: SessionType;
   onShowConnections?: () => void;
   hasBackgroundSessions?: boolean;
@@ -80,10 +77,9 @@ export default function TabBar({
   onTabClose,
   onToggleKeyboard,
   isCustomKeyboardVisible,
-  hiddenInputRef,
+  isKeyboardIntentionallyHidden,
   onHideKeyboard,
   onShowKeyboard,
-  keyboardIntentionallyHiddenRef,
   activeSessionType,
   onShowConnections,
 }: TabBarProps) {
@@ -97,14 +93,10 @@ export default function TabBar({
   const needsBottomPadding = activeSessionType !== "terminal";
 
   const handleToggleSystemKeyboard = () => {
-    if (keyboardIntentionallyHiddenRef.current) {
+    if (isKeyboardIntentionallyHidden) {
       onShowKeyboard?.();
-      setTimeout(() => {
-        hiddenInputRef.current?.focus();
-      }, 50);
     } else {
       onHideKeyboard?.();
-      Keyboard.dismiss();
     }
   };
 
@@ -137,7 +129,9 @@ export default function TabBar({
           }}
         >
           {/* Connections panel button */}
-          <View style={{ position: "relative", marginRight: isLandscape ? 6 : 8 }}>
+          <View
+            style={{ position: "relative", marginRight: isLandscape ? 6 : 8 }}
+          >
             <TouchableOpacity
               onPress={onShowConnections}
               focusable={false}
@@ -250,7 +244,7 @@ export default function TabBar({
                         strokeWidth={2}
                       />
                       <Text
-                        className="text-sm font-medium flex-1"
+                        className="flex-1 text-sm font-medium"
                         style={{ color: iconColor }}
                         numberOfLines={1}
                       >
@@ -277,7 +271,9 @@ export default function TabBar({
                     >
                       <X
                         size={isLandscape ? 13 : 14}
-                        color={isActive ? TEXT_COLORS.PRIMARY : TEXT_COLORS.TERTIARY}
+                        color={
+                          isActive ? TEXT_COLORS.PRIMARY : TEXT_COLORS.TERTIARY
+                        }
                         strokeWidth={2.5}
                       />
                     </TouchableOpacity>
@@ -308,7 +304,7 @@ export default function TabBar({
                 marginLeft: isLandscape ? 6 : 8,
               }}
             >
-              {keyboardIntentionallyHiddenRef.current ? (
+              {isKeyboardIntentionallyHidden ? (
                 <ChevronUp size={isLandscape ? 18 : 20} color="#ffffff" />
               ) : (
                 <ChevronDown size={isLandscape ? 18 : 20} color="#ffffff" />

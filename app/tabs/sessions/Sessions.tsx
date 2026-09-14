@@ -156,6 +156,28 @@ export default function Sessions() {
     (session) => session.id === activeSessionId,
   );
 
+  const handleHideSystemKeyboard = useCallback(() => {
+    setKeyboardIntentionallyHidden(true);
+    hiddenInputRef.current?.blur();
+    Keyboard.dismiss();
+  }, [setKeyboardIntentionallyHidden]);
+
+  const handleShowSystemKeyboard = useCallback(() => {
+    if (isCustomKeyboardVisible || activeSession?.type !== "terminal") return;
+
+    setKeyboardIntentionallyHidden(false);
+    setTimeout(() => {
+      if (!keyboardIntentionallyHiddenRef.current) {
+        hiddenInputRef.current?.focus();
+      }
+    }, 100);
+  }, [
+    activeSession?.type,
+    isCustomKeyboardVisible,
+    keyboardIntentionallyHiddenRef,
+    setKeyboardIntentionallyHidden,
+  ]);
+
   const getActiveTerminalRef = useCallback(() => {
     return activeSessionId ? terminalRefs.current[activeSessionId] : null;
   }, [activeSessionId]);
@@ -408,8 +430,7 @@ export default function Sessions() {
             return true;
           }
           if (isKeyboardVisible) {
-            setKeyboardIntentionallyHidden(true);
-            Keyboard.dismiss();
+            handleHideSystemKeyboard();
             return true;
           }
           return true;
@@ -420,7 +441,12 @@ export default function Sessions() {
         backHandler.remove();
       };
     }
-  }, [sessions.length, isKeyboardVisible, showConnectionsPanel]);
+  }, [
+    handleHideSystemKeyboard,
+    isKeyboardVisible,
+    sessions.length,
+    showConnectionsPanel,
+  ]);
 
   useEffect(() => {
     const subscription = Dimensions.addEventListener("change", ({ window }) => {
@@ -459,22 +485,13 @@ export default function Sessions() {
           keyboardIntentionallyHiddenRef.current;
 
         if (!keyboardIntentionallyHiddenRef.current) {
-          setKeyboardIntentionallyHidden(true);
-          hiddenInputRef.current?.blur();
-          Keyboard.dismiss();
-        } else {
+          handleHideSystemKeyboard();
         }
       } else if (!isCurrentlySelecting && isSelectingRef.current) {
         isSelectingRef.current = false;
 
         if (!keyboardWasHiddenBeforeSelectionRef.current) {
-          setKeyboardIntentionallyHidden(false);
-          if (!isCustomKeyboardVisible) {
-            setTimeout(() => {
-              hiddenInputRef.current?.focus();
-            }, 100);
-          }
-        } else {
+          handleShowSystemKeyboard();
         }
 
         keyboardWasHiddenBeforeSelectionRef.current = false;
@@ -486,8 +503,9 @@ export default function Sessions() {
   }, [
     activeSessionId,
     activeSession?.type,
-    isCustomKeyboardVisible,
-    setKeyboardIntentionallyHidden,
+    handleHideSystemKeyboard,
+    handleShowSystemKeyboard,
+    keyboardIntentionallyHiddenRef,
   ]);
 
   useEffect(() => {
@@ -547,13 +565,8 @@ export default function Sessions() {
   );
 
   const handleTerminalKeyboardRequest = useCallback(() => {
-    if (isCustomKeyboardVisible) return;
-
-    setKeyboardIntentionallyHidden(false);
-    setTimeout(() => {
-      hiddenInputRef.current?.focus();
-    }, 100);
-  }, [isCustomKeyboardVisible, setKeyboardIntentionallyHidden]);
+    handleShowSystemKeyboard();
+  }, [handleShowSystemKeyboard]);
 
   const handleTabPress = (sessionId: string) => {
     const session = sessions.find((s) => s.id === sessionId);
@@ -582,15 +595,8 @@ export default function Sessions() {
 
   const closeConnectionsPanel = useCallback(() => {
     setShowConnectionsPanel(false);
-    if (activeSession?.type === "terminal" && !isCustomKeyboardVisible) {
-      setKeyboardIntentionallyHidden(false);
-      setTimeout(() => hiddenInputRef.current?.focus(), 100);
-    }
-  }, [
-    activeSession?.type,
-    isCustomKeyboardVisible,
-    setKeyboardIntentionallyHidden,
-  ]);
+    handleShowSystemKeyboard();
+  }, [handleShowSystemKeyboard]);
 
   const handleAddSession = () => {
     router.navigate("/hosts" as any);
@@ -930,15 +936,12 @@ export default function Sessions() {
           onAddSession={handleAddSession}
           onToggleKeyboard={handleToggleKeyboard}
           isCustomKeyboardVisible={isCustomKeyboardVisible}
-          hiddenInputRef={hiddenInputRef}
-          onHideKeyboard={() => setKeyboardIntentionallyHidden(true)}
-          onShowKeyboard={() => setKeyboardIntentionallyHidden(false)}
-          keyboardIntentionallyHiddenRef={keyboardIntentionallyHiddenRef}
+          isKeyboardIntentionallyHidden={keyboardIntentionallyHiddenRef.current}
+          onHideKeyboard={handleHideSystemKeyboard}
+          onShowKeyboard={handleShowSystemKeyboard}
           activeSessionType={activeSession?.type}
           onShowConnections={() => {
-            setKeyboardIntentionallyHidden(true);
-            Keyboard.dismiss();
-            hiddenInputRef.current?.blur();
+            handleHideSystemKeyboard();
             setShowConnectionsPanel(true);
           }}
           hasBackgroundSessions={backgroundTabRecords.some(

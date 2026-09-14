@@ -380,11 +380,60 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       -webkit-tap-highlight-color: transparent;
       -webkit-touch-callout: none;
     }
-    html, body, #terminal, .xterm {
-      user-select: text;
-      -webkit-user-select: text;
-      -ms-user-select: text;
-      -moz-user-select: text;
+
+    html, body, #terminal, .xterm, .xterm-screen,
+    .xterm-accessibility, .xterm-accessibility-tree {
+      user-select: none;
+      -webkit-user-select: none;
+      -ms-user-select: none;
+      -moz-user-select: none;
+    }
+
+    .terminal-native-selection-overlay,
+    .terminal-native-selection-row,
+    .terminal-native-selection-text {
+      user-select: text !important;
+      -webkit-user-select: text !important;
+      -ms-user-select: text !important;
+      -moz-user-select: text !important;
+      -webkit-touch-callout: default !important;
+    }
+
+    .terminal-native-selection-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 20;
+      overflow: hidden;
+      pointer-events: auto;
+      cursor: text;
+      margin: 0;
+      padding: 0;
+      color: transparent !important;
+      background: transparent;
+      -webkit-text-fill-color: transparent !important;
+    }
+
+    .terminal-native-selection-row {
+      display: block;
+      overflow: hidden;
+      margin: 0;
+      padding: 0;
+      white-space: pre;
+      color: transparent !important;
+      background: transparent;
+      -webkit-text-fill-color: transparent !important;
+    }
+
+    .terminal-native-selection-text {
+      white-space: pre;
+      color: transparent !important;
+      -webkit-text-fill-color: transparent !important;
+    }
+
+    .terminal-native-selection-text::selection {
+      color: transparent;
+      background: ${themeColors.selectionBackground || "rgba(255, 255, 255, 0.3)"};
+      -webkit-text-fill-color: transparent;
     }
 
     input, textarea, [contenteditable], .xterm-helper-textarea {
@@ -566,16 +615,18 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     };
 
     const terminalElement = document.getElementById('terminal');
+    const terminalScreen = terminal.element && terminal.element.querySelector('.xterm-screen');
+    const nativeSelectionOverlay = document.createElement('div');
+    nativeSelectionOverlay.className = 'terminal-native-selection-overlay';
+    nativeSelectionOverlay.setAttribute('aria-hidden', 'true');
+    nativeSelectionOverlay.setAttribute('role', 'presentation');
+    if (terminalScreen) {
+      terminalScreen.appendChild(nativeSelectionOverlay);
+    }
 
     window.resetScroll = function() {
       terminal.scrollToBottom();
       scheduleScrollStateUpdate();
-    }
-
-    window.clearTerminalSelection = function() {
-      try {
-        terminal.clearSelection();
-      } catch(e) {}
     }
 
     document.addEventListener('focusin', function(e) {
@@ -602,26 +653,24 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       }
     }, true);
 
-    terminalElement.addEventListener('contextmenu', function(e){
-      e.preventDefault();
-      e.stopPropagation();
-      return false;
-    }, { passive: false });
-
-    let selectionEndTimeout = null;
     let isCurrentlySelecting = false;
-    let lastInteractionTime = Date.now();
+    let nativeSelectionSyncFrame = null;
+    let nativeSelectionDirty = true;
+    let nativeSelectionSnapshot = '';
+    let mirrorInteractionActive = false;
+    let touchInteractionActive = false;
     let touchStartX = 0;
     let touchStartY = 0;
-    let lastTouchX = 0;
-    let lastTouchY = 0;
+    let touchStartTime = 0;
     let scrollTouchY = null;
     let pendingScrollLines = 0;
-    let hasMoved = false;
-    let longPressTimeout = null;
-    let selectionGestureActive = false;
-    let touchStartedInSelection = false;
-    const touchScrollLineHeight = terminal._core._renderService.dimensions.css.cell.height || ${baseFontSize * 1.2};
+    let touchMoved = false;
+    let touchScrollClaimed = false;
+    let touchStartedWithSelection = false;
+    let blankLongPressTimeout = null;
+    let blankContextMenuOpened = false;
+    const nativeSelectionHoldThreshold = 350;
+    const blankContextMenuDelay = 600;
 
     function postTerminalContextMenu(selection) {
       if (!window.ReactNativeWebView) return;
@@ -657,107 +706,295 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
       }));
     }
 
-    function cancelLongPress() {
-      if (longPressTimeout) {
-        clearTimeout(longPressTimeout);
-        longPressTimeout = null;
+    function cancelBlankLongPress() {
+      if (blankLongPressTimeout) {
+        clearTimeout(blankLongPressTimeout);
+        blankLongPressTimeout = null;
       }
     }
 
-    function getBufferCellAt(clientX, clientY) {
-      const screen = terminal.element && terminal.element.querySelector('.xterm-screen');
-      const cell = terminal._core._renderService.dimensions.css.cell;
-      if (!screen || !cell || !cell.width || !cell.height) return null;
+    function getNativeSelectionRange() {
+      if (!nativeSelectionOverlay.parentNode) return null;
 
-      const rect = screen.getBoundingClientRect();
-      if (
-        clientX < rect.left ||
-        clientX >= rect.right ||
-        clientY < rect.top ||
-        clientY >= rect.bottom
-      ) {
-        return null;
-      }
+      try {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+          return null;
+        }
 
-      return {
-        x: Math.max(0, Math.min(terminal.cols - 1, Math.floor((clientX - rect.left) / cell.width))),
-        y: terminal.buffer.active.viewportY + Math.max(
-          0,
-          Math.min(terminal.rows - 1, Math.floor((clientY - rect.top) / cell.height))
-        )
-      };
+        const range = selection.getRangeAt(0);
+        if (range.intersectsNode(nativeSelectionOverlay)) {
+          return range;
+        }
+      } catch(e) {}
+
+      return null;
     }
 
-    function isPointInSelection(clientX, clientY) {
-      const position = terminal.getSelectionPosition();
-      const cell = getBufferCellAt(clientX, clientY);
-      if (!position || !cell) return false;
+    function hasTerminalSelection() {
+      if (getNativeSelectionRange()) return true;
 
-      const start = position.start;
-      const end = position.end;
-      return (
-        (cell.y > start.y && cell.y < end.y) ||
-        (start.y === end.y && cell.y === start.y && cell.x >= start.x && cell.x < end.x) ||
-        (start.y < end.y && cell.y === end.y && cell.x < end.x) ||
-        (start.y < end.y && cell.y === start.y && cell.x >= start.x)
-      );
-    }
-
-    function dispatchSelectionMouseEvent(type, clientX, clientY, detail) {
-      const mouseReportingActive = !!(
-        terminal.element && terminal.element.classList.contains('enable-mouse-events')
-      );
-      const isMacPlatform = [
-        'Macintosh',
-        'MacIntel',
-        'MacPPC',
-        'Mac68K'
-      ].indexOf(navigator.platform) !== -1;
-      const event = new MouseEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        clientX: clientX,
-        clientY: clientY,
-        button: 0,
-        buttons: type === 'mouseup' ? 0 : 1,
-        detail: detail || 1,
-        shiftKey: mouseReportingActive && !isMacPlatform,
-        altKey: mouseReportingActive && isMacPlatform
-      });
-
-      if (type === 'mousedown') {
-        terminal.element.dispatchEvent(event);
-      } else {
-        document.dispatchEvent(event);
+      try {
+        return terminal.hasSelection();
+      } catch(e) {
+        return false;
       }
     }
 
-    function beginTouchSelection() {
-      longPressTimeout = null;
-      if (hasMoved || touchStartedInSelection) return;
-
-      selectionGestureActive = true;
-      lastInteractionTime = Date.now();
-      // detail=2 starts with the word under the finger selected, then xterm's
-      // own mousemove handling extends that selection while the finger drags.
-      dispatchSelectionMouseEvent('mousedown', touchStartX, touchStartY, 2);
-      postSelectionStart();
-    }
-
-    function finishTouchSelection() {
-      if (!selectionGestureActive) return;
-
-      dispatchSelectionMouseEvent('mouseup', lastTouchX, lastTouchY, 1);
-      selectionGestureActive = false;
-      lastInteractionTime = Date.now();
-
-      if (terminal.hasSelection()) {
+    function updateTerminalSelectionState() {
+      if (hasTerminalSelection()) {
         postSelectionStart();
       } else {
         postSelectionEnd();
       }
     }
+
+    function syncNativeSelectionOverlay() {
+      nativeSelectionSyncFrame = null;
+      if (
+        !nativeSelectionDirty ||
+        !nativeSelectionOverlay.parentNode ||
+        mirrorInteractionActive ||
+        getNativeSelectionRange()
+      ) {
+        return;
+      }
+
+      try {
+        const dimensions = terminal._core._renderService.dimensions.css;
+        const cell = dimensions && dimensions.cell;
+        const buffer = terminal.buffer.active;
+        if (!cell || !cell.width || !cell.height || !buffer) return;
+
+        const rows = [];
+        for (let viewportRow = 0; viewportRow < terminal.rows; viewportRow += 1) {
+          const bufferRow = buffer.viewportY + viewportRow;
+          const line = buffer.getLine(bufferRow);
+          rows.push({
+            bufferRow: bufferRow,
+            isWrapped: !!(line && line.isWrapped),
+            text: line ? line.translateToString(true) : ''
+          });
+        }
+
+        const canvas = dimensions.canvas || {};
+        const overlayWidth = canvas.width || cell.width * terminal.cols;
+        const overlayHeight = canvas.height || cell.height * terminal.rows;
+        const snapshot = JSON.stringify({
+          cols: terminal.cols,
+          rows: terminal.rows,
+          viewportY: buffer.viewportY,
+          width: overlayWidth,
+          height: overlayHeight,
+          lines: rows
+        });
+
+        nativeSelectionDirty = false;
+        if (snapshot === nativeSelectionSnapshot) return;
+        nativeSelectionSnapshot = snapshot;
+
+        nativeSelectionOverlay.style.width = overlayWidth + 'px';
+        nativeSelectionOverlay.style.height = overlayHeight + 'px';
+        nativeSelectionOverlay.style.fontFamily = terminal.options.fontFamily;
+        nativeSelectionOverlay.style.fontSize = terminal.options.fontSize + 'px';
+        nativeSelectionOverlay.style.fontWeight = terminal.options.fontWeight;
+        nativeSelectionOverlay.style.letterSpacing = terminal.options.letterSpacing + 'px';
+        nativeSelectionOverlay.style.lineHeight = cell.height + 'px';
+
+        const fragment = document.createDocumentFragment();
+        rows.forEach(function(rowData) {
+          const row = document.createElement('div');
+          row.className = 'terminal-native-selection-row';
+          row.style.height = cell.height + 'px';
+          row.style.lineHeight = cell.height + 'px';
+          row.dataset.bufferRow = String(rowData.bufferRow);
+          row.dataset.isWrapped = rowData.isWrapped ? 'true' : 'false';
+          row.__terminalText = rowData.text;
+
+          const text = document.createElement('span');
+          text.className = 'terminal-native-selection-text';
+          text.textContent = rowData.text;
+          row.appendChild(text);
+          fragment.appendChild(row);
+        });
+
+        nativeSelectionOverlay.textContent = '';
+        nativeSelectionOverlay.appendChild(fragment);
+      } catch(e) {}
+    }
+
+    function scheduleNativeSelectionOverlaySync() {
+      nativeSelectionDirty = true;
+      if (
+        nativeSelectionSyncFrame !== null ||
+        mirrorInteractionActive ||
+        getNativeSelectionRange()
+      ) {
+        return;
+      }
+
+      nativeSelectionSyncFrame = requestAnimationFrame(syncNativeSelectionOverlay);
+    }
+
+    function isPointOverMirrorText(clientX, clientY) {
+      try {
+        const element = document.elementFromPoint(clientX, clientY);
+        const text = element && element.closest
+          ? element.closest('.terminal-native-selection-text')
+          : null;
+        if (!text || !nativeSelectionOverlay.contains(text)) return false;
+
+        const rect = text.getBoundingClientRect();
+        return (
+          clientX >= rect.left - 2 &&
+          clientX <= rect.right + 2 &&
+          clientY >= rect.top &&
+          clientY <= rect.bottom
+        );
+      } catch(e) {
+        return false;
+      }
+    }
+
+    function getBoundaryOffset(row, text, container, offset) {
+      const terminalText = row.__terminalText || '';
+      if (!terminalText) return 0;
+
+      if (container === row || container === text) {
+        return offset <= 0 ? 0 : terminalText.length;
+      }
+
+      if (!text.contains(container)) {
+        return 0;
+      }
+
+      try {
+        const prefix = document.createRange();
+        prefix.selectNodeContents(text);
+        prefix.setEnd(container, offset);
+        return Math.max(0, Math.min(terminalText.length, prefix.toString().length));
+      } catch(e) {
+        return 0;
+      }
+    }
+
+    function joinTerminalSelectionRows(selectedRows) {
+      let result = '';
+      selectedRows.forEach(function(selectedRow, index) {
+        result += selectedRow.text;
+        if (index >= selectedRows.length - 1) return;
+
+        if (!selectedRows[index + 1].isWrapped) {
+          result += '\\n';
+        }
+      });
+      return result;
+    }
+
+    function getNormalizedNativeSelectionText(range) {
+      const selectedRows = [];
+      const rows = nativeSelectionOverlay.querySelectorAll('.terminal-native-selection-row');
+
+      rows.forEach(function(row) {
+        let intersects = false;
+        try {
+          intersects = range.intersectsNode(row);
+        } catch(e) {}
+        if (!intersects) return;
+
+        const text = row.querySelector('.terminal-native-selection-text');
+        if (!text) return;
+
+        const terminalText = row.__terminalText || '';
+        const startInside = row === range.startContainer || row.contains(range.startContainer);
+        const endInside = row === range.endContainer || row.contains(range.endContainer);
+        const start = startInside
+          ? getBoundaryOffset(row, text, range.startContainer, range.startOffset)
+          : 0;
+        const end = endInside
+          ? getBoundaryOffset(row, text, range.endContainer, range.endOffset)
+          : terminalText.length;
+
+        selectedRows.push({
+          isWrapped: row.dataset.isWrapped === 'true',
+          text: terminalText.slice(Math.min(start, end), Math.max(start, end))
+        });
+      });
+
+      if (selectedRows.length === 0) {
+        const selection = window.getSelection();
+        return selection ? selection.toString() : '';
+      }
+
+      return joinTerminalSelectionRows(selectedRows);
+    }
+
+    window.clearTerminalSelection = function() {
+      try {
+        const selection = window.getSelection();
+        if (selection) {
+          selection.removeAllRanges();
+        }
+      } catch(e) {}
+      try {
+        terminal.clearSelection();
+      } catch(e) {}
+
+      touchInteractionActive = false;
+      mirrorInteractionActive = false;
+      nativeSelectionDirty = true;
+      updateTerminalSelectionState();
+      scheduleNativeSelectionOverlaySync();
+    }
+
+    document.addEventListener('selectionchange', function() {
+      const nativeSelection = getNativeSelectionRange();
+      if (nativeSelection) {
+        cancelBlankLongPress();
+      }
+      updateTerminalSelectionState();
+      if (!nativeSelection) {
+        scheduleNativeSelectionOverlaySync();
+      }
+    });
+
+    document.addEventListener('copy', function(e) {
+      const range = getNativeSelectionRange();
+      if (!range || !e.clipboardData) return;
+
+      try {
+        e.clipboardData.setData('text/plain', getNormalizedNativeSelectionText(range));
+        e.preventDefault();
+      } catch(error) {}
+    }, true);
+
+    nativeSelectionOverlay.addEventListener('contextmenu', function(e) {
+      // Stop xterm's context-menu handler from selecting its hidden textarea,
+      // but keep the WebView default so iOS/Android can show the system menu.
+      e.stopPropagation();
+    }, true);
+
+    nativeSelectionOverlay.addEventListener('mousedown', function(e) {
+      if (!touchInteractionActive) {
+        mirrorInteractionActive = true;
+      }
+      e.stopPropagation();
+    }, true);
+
+    nativeSelectionOverlay.addEventListener('mouseup', function(e) {
+      e.stopPropagation();
+      if (!touchInteractionActive) {
+        finishMirrorInteraction();
+      }
+    }, true);
+
+    nativeSelectionOverlay.addEventListener('click', function(e) {
+      e.stopPropagation();
+    }, true);
+
+    nativeSelectionOverlay.addEventListener('dblclick', function(e) {
+      e.stopPropagation();
+    }, true);
 
     // Keep touch scrolling routed through xterm so normal scrollback and
     // alternate-screen TUI mouse/key reporting continue to work.
@@ -769,7 +1006,9 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
 
       const dy = scrollTouchY - clientY;
       scrollTouchY = clientY;
-      pendingScrollLines += dy / touchScrollLineHeight;
+      const cell = terminal._core._renderService.dimensions.css.cell;
+      const lineHeight = (cell && cell.height) || ${baseFontSize * 1.2};
+      pendingScrollLines += dy / lineHeight;
       const wholeLines = Math.trunc(pendingScrollLines);
       if (wholeLines === 0) return;
 
@@ -784,161 +1023,164 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     }
 
     function resetTouchGesture() {
-      cancelLongPress();
-      hasMoved = false;
-      touchStartedInSelection = false;
+      cancelBlankLongPress();
+      touchMoved = false;
+      touchScrollClaimed = false;
+      touchStartedWithSelection = false;
+      blankContextMenuOpened = false;
       scrollTouchY = null;
       pendingScrollLines = 0;
     }
 
-    terminalElement.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      lastInteractionTime = Date.now();
-      finishTouchSelection();
+    function finishMirrorInteraction() {
+      if (!mirrorInteractionActive) return;
+      mirrorInteractionActive = false;
+      setTimeout(function() {
+        updateTerminalSelectionState();
+        scheduleNativeSelectionOverlaySync();
+      }, 120);
+    }
+
+    nativeSelectionOverlay.addEventListener('touchstart', function(e) {
+      e.stopPropagation();
       resetTouchGesture();
+      touchInteractionActive = true;
+      mirrorInteractionActive = true;
 
       if (!e.touches || e.touches.length !== 1) {
-        hasMoved = true;
+        touchMoved = true;
+        e.preventDefault();
         return;
       }
 
       const touch = e.touches[0];
       touchStartX = touch.clientX;
       touchStartY = touch.clientY;
-      lastTouchX = touch.clientX;
-      lastTouchY = touch.clientY;
+      touchStartTime = Date.now();
       scrollTouchY = touch.clientY;
-      touchStartedInSelection = isPointInSelection(touch.clientX, touch.clientY);
+      touchStartedWithSelection = hasTerminalSelection();
 
-      if (!touchStartedInSelection) {
-        longPressTimeout = setTimeout(beginTouchSelection, 350);
+      if (
+        !touchStartedWithSelection &&
+        !isPointOverMirrorText(touch.clientX, touch.clientY)
+      ) {
+        blankLongPressTimeout = setTimeout(function() {
+          blankLongPressTimeout = null;
+          if (
+            touchMoved ||
+            touchScrollClaimed ||
+            getNativeSelectionRange()
+          ) {
+            return;
+          }
+
+          blankContextMenuOpened = true;
+          postTerminalContextMenu('');
+        }, blankContextMenuDelay);
       }
-    }, { passive: false, capture: true });
+    }, { passive: false });
 
-    terminalElement.addEventListener('touchmove', (e) => {
-      e.preventDefault();
-      e.stopImmediatePropagation();
+    nativeSelectionOverlay.addEventListener('touchmove', function(e) {
+      e.stopPropagation();
 
       if (!e.touches || e.touches.length !== 1) {
-        hasMoved = true;
-        cancelLongPress();
-        finishTouchSelection();
+        touchMoved = true;
+        cancelBlankLongPress();
+        e.preventDefault();
         return;
       }
 
       const touch = e.touches[0];
-      lastTouchX = touch.clientX;
-      lastTouchY = touch.clientY;
       const deltaX = Math.abs(touch.clientX - touchStartX);
       const deltaY = Math.abs(touch.clientY - touchStartY);
+      const heldFor = Date.now() - touchStartTime;
 
       if (deltaX > 10 || deltaY > 10) {
-        hasMoved = true;
-        if (!selectionGestureActive) {
-          cancelLongPress();
+        touchMoved = true;
+        cancelBlankLongPress();
+
+        if (
+          !touchScrollClaimed &&
+          !touchStartedWithSelection &&
+          !getNativeSelectionRange() &&
+          heldFor < nativeSelectionHoldThreshold
+        ) {
+          touchScrollClaimed = true;
         }
       }
 
-      if (selectionGestureActive) {
-        dispatchSelectionMouseEvent('mousemove', touch.clientX, touch.clientY, 1);
-      } else if (hasMoved) {
+      if (touchScrollClaimed) {
+        e.preventDefault();
         dispatchTouchScroll(touch.clientY);
       }
-    }, { passive: false, capture: true });
+    }, { passive: false });
 
-    terminalElement.addEventListener('touchend', (e) => {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      cancelLongPress();
-
-      const touch = e.changedTouches && e.changedTouches[0];
-      if (touch) {
-        lastTouchX = touch.clientX;
-        lastTouchY = touch.clientY;
-      }
+    nativeSelectionOverlay.addEventListener('touchend', function(e) {
+      e.stopPropagation();
+      cancelBlankLongPress();
 
       if (e.touches && e.touches.length > 0) {
-        hasMoved = true;
-        finishTouchSelection();
+        touchMoved = true;
         return;
       }
 
-      if (selectionGestureActive) {
-        finishTouchSelection();
-      } else if (!hasMoved) {
-        const selection = terminal.getSelection();
-        if (
-          selection &&
-          touchStartedInSelection &&
-          isPointInSelection(lastTouchX, lastTouchY)
-        ) {
-          postTerminalContextMenu(selection);
-        } else {
-          if (terminal.hasSelection()) {
-            terminal.clearSelection();
-          }
-          postSelectionEnd();
-          postTerminalKeyboardRequest();
-        }
+      const heldFor = Date.now() - touchStartTime;
+      const nativeSelection = getNativeSelectionRange();
+
+      if (touchScrollClaimed) {
+        e.preventDefault();
+      } else if (
+        !touchMoved &&
+        !blankContextMenuOpened &&
+        !touchStartedWithSelection &&
+        !nativeSelection &&
+        heldFor < nativeSelectionHoldThreshold
+      ) {
+        try {
+          terminal.clearSelection();
+        } catch(error) {}
+        postSelectionEnd();
+        postTerminalKeyboardRequest();
       }
 
       resetTouchGesture();
-    }, { passive: false, capture: true });
+      touchInteractionActive = false;
+      finishMirrorInteraction();
+    }, { passive: false });
 
-    terminalElement.addEventListener('touchcancel', (e) => {
+    nativeSelectionOverlay.addEventListener('touchcancel', function(e) {
+      e.stopPropagation();
+      cancelBlankLongPress();
+      if (touchScrollClaimed) {
+        e.preventDefault();
+      }
+      resetTouchGesture();
+      touchInteractionActive = false;
+      finishMirrorInteraction();
+    }, { passive: false });
+
+    nativeSelectionOverlay.addEventListener('wheel', function(e) {
+      if (!getNativeSelectionRange()) return;
       e.preventDefault();
-      e.stopImmediatePropagation();
-      // Keep this gesture blocked until the next touchstart so a stray touchend
-      // after cancellation cannot be mistaken for a plain tap.
-      hasMoved = true;
-      cancelLongPress();
-      finishTouchSelection();
-    }, { passive: false, capture: true });
+      e.stopPropagation();
+    }, { passive: false });
 
-    terminalElement.addEventListener('mousedown', () => {
-      lastInteractionTime = Date.now();
-    });
+    document.addEventListener('mouseup', function() {
+      if (!mirrorInteractionActive || touchInteractionActive) return;
+      finishMirrorInteraction();
+    }, true);
 
-    terminalElement.addEventListener('mouseup', () => {
-      lastInteractionTime = Date.now();
-      checkIfDoneSelecting();
-    });
-
-    function checkIfDoneSelecting() {
-      if (selectionEndTimeout) {
-        clearTimeout(selectionEndTimeout);
-      }
-
-      selectionEndTimeout = setTimeout(() => {
-        const selection = terminal.getSelection();
-        const hasSelection = selection && selection.length > 0;
-
-        if (hasSelection) {
-          postSelectionStart();
-        } else if (isCurrentlySelecting) {
-          const timeSinceLastInteraction = Date.now() - lastInteractionTime;
-          if (timeSinceLastInteraction >= 150) {
-            postSelectionEnd();
-          } else {
-            checkIfDoneSelecting();
-          }
-        }
-      }, 100);
+    terminal.onSelectionChange(updateTerminalSelectionState);
+    terminal.onRender(scheduleNativeSelectionOverlaySync);
+    terminal.onScroll(scheduleNativeSelectionOverlaySync);
+    terminal.onResize(scheduleNativeSelectionOverlaySync);
+    if (
+      terminal.buffer &&
+      typeof terminal.buffer.onBufferChange === 'function'
+    ) {
+      terminal.buffer.onBufferChange(scheduleNativeSelectionOverlaySync);
     }
-
-    terminal.onSelectionChange(() => {
-      const selection = terminal.getSelection();
-      const hasSelection = selection && selection.length > 0;
-
-      if (hasSelection) {
-        lastInteractionTime = Date.now();
-        postSelectionStart();
-      } else if (isCurrentlySelecting) {
-        lastInteractionTime = Date.now();
-        checkIfDoneSelecting();
-      }
-    });
+    scheduleNativeSelectionOverlaySync();
 
     function handleResize() {
       fitAddon.fit();
@@ -1553,6 +1795,7 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
               mediaPlaybackRequiresUserAction={false}
               keyboardDisplayRequiresUserAction={false}
               hideKeyboardAccessoryView={true}
+              textInteractionEnabled={true}
               cacheEnabled={false}
               cacheMode="LOAD_NO_CACHE"
               androidLayerType="hardware"
