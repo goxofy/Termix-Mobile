@@ -431,9 +431,9 @@ const TerminalComponent = forwardRef<TerminalHandle, TerminalProps>(
     }
 
     .terminal-native-selection-text::selection {
-      color: transparent;
+      color: ${themeColors.selectionForeground || themeColors.foreground} !important;
       background: ${themeColors.selectionBackground || "rgba(255, 255, 255, 0.3)"};
-      -webkit-text-fill-color: transparent;
+      -webkit-text-fill-color: ${themeColors.selectionForeground || themeColors.foreground} !important;
     }
 
     input, textarea, [contenteditable], .xterm-helper-textarea {
